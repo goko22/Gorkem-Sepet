@@ -2426,10 +2426,15 @@ async def scrape_browser(
         )
 
         # NETWORKIDLE YOK.
-        await page.goto(
-            url,
-            wait_until="domcontentloaded",
-            timeout=BROWSER_GOTO_TIMEOUT,
+      try:
+    await page.goto(
+        url,
+        wait_until="domcontentloaded",
+        timeout=BROWSER_GOTO_TIMEOUT,
+    )
+except Exception as e:
+    print("Sayfa tam yüklenmedi ama devam ediyorum:", e)
+    await page.wait_for_timeout(1200)
         )
 
         final_url = page.url
