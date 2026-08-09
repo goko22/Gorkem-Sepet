@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Tüm Sepetim</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Inter, system-ui, Arial, sans-serif;
+      background: #0b0f14;
+      color: #f3f6f9;
+    }
+    .wrap { max-width: 1120px; margin: 0 auto; padding: 28px 18px 64px; }
+    h1 { margin: 0 0 8px; font-size: 34px; }
+    .sub { color: #97a4b3; margin-bottom: 24px; }
+    .panel {
+      background: #121923;
+      border: 1px solid #253041;
+      border-radius: 16px;
+      padding: 16px;
+      margin-bottom: 18px;
+    }
+    .add-row { display: grid; grid-template-columns: 1fr auto; gap: 10px; }
+    input, button {
+      border-radius: 10px;
+      border: 1px solid #2b394c;
+      padding: 12px 14px;
+      font-size: 15px;
+    }
+    input {
+      width: 100%;
+      background: #0e141d;
+      color: white;
+    }
+    button {
+      cursor: pointer;
+      background: #27c281;
+      color: #06130d;
+      font-weight: 700;
+    }
+    button.danger { background: #2a1116; color: #ff6c7b; border-color: #54222c; }
+    .status { margin-top: 10px; color: #97a4b3; min-height: 22px; }
+    .summary {
+      display: grid;
+      grid-template-columns: repeat(3,1fr);
+      gap: 12px;
+      margin-bottom: 18px;
+    }
+    .stat { background:#121923; border:1px solid #253041; border-radius:14px; padding:14px; }
+    .stat small { color:#97a4b3; }
+    .stat strong { display:block; font-size:24px; margin-top:5px; }
+    .list { display: grid; gap: 10px; }
+    .product {
+      background:#121923;
+      border:1px solid #253041;
+      border-radius:14px;
+      padding: 13px;
+      display:grid;
+      grid-template-columns: 86px 1fr auto;
+      gap:14px;
+      align-items:center;
+    }
+    .thumb {
+      width:86px; height:86px; object-fit:contain; border-radius:10px;
+      background:#fff;
+    }
+    .title { font-weight:700; margin-bottom:6px; }
+    .meta { color:#97a4b3; font-size:14px; margin-bottom:4px; }
+    .price { font-size:22px; font-weight:800; color:#72e7af; text-align:right; }
+    .actions { display:flex; gap:8px; margin-top:8px; justify-content:flex-end; }
+    .actions button { padding:7px 10px; font-size:13px; }
+    .qty { width:70px; padding:7px; }
+    a { color:#89bdf8; text-decoration:none; }
+    @media (max-width:700px) {
+      .summary { grid-template-columns:1fr; }
+      .add-row { grid-template-columns:1fr; }
+      .product { grid-template-columns:68px 1fr; }
+      .thumb { width:68px;height:68px; }
+      .right { grid-column:1 / -1; display:flex; justify-content:space-between; align-items:center; }
+      .price { text-align:left; }
+    }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <h1>Tüm Sepetim</h1>
+    <div class="sub">Farklı mağazalardaki ürünlerini tek sepette tut, fiyatlarını karşılaştır.</div>
+
+    <section class="panel">
+      <div class="add-row">
+        <input id="url" type="url" placeholder="Ürün linkini yapıştır..." />
+        <button id="addBtn">Sepete ekle</button>
+      </div>
+      <div id="status" class="status"></div>
+    </section>
+
+    <section class="summary">
+      <div class="stat"><small>Ürün</small><strong id="count">0</strong></div>
+      <div class="stat"><small>Sepet toplamı</small><strong id="total">₺0</strong></div>
+      <div class="stat"><small>Destek</small><strong>10+ mağaza</strong></div>
+    </section>
+
+    <section id="list" class="list"></section>
+  </main>
+
+<script>
+const listEl = document.getElementById("list");
+const statusEl = document.getElementById("status");
+const urlEl = document.getElementById("url");
+const addBtn = document.getElementById("addBtn");
+const countEl = document.getElementById("count");
+const totalEl = document.getElementById("total");
+
+const money = n => n == null ? "Fiyat yok" : new Intl.NumberFormat("tr-TR", {
+  style:"currency", currency:"TRY"
+}).format(n);
+
+async function api(path, options={}) {
+  const r = await fetch(path, {
+    headers: {"Content-Type":"application/json"},
+    ...options
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.detail || "İşlem başarısız.");
+  return data;
+}
+
+async function load() {
+  const products = await api("/api/products");
+  render(products);
+}
+
+function render(products) {
+  listEl.innerHTML = "";
+  countEl.textContent = products.length;
+  let total = 0;
+
+  products.forEach(p => {
+    if (p.source_price != null) total += p.source_price * p.quantity;
+
+    const el = document.createElement("article");
+    el.className = "product";
+    el.innerHTML = `
+      <img class="thumb" src="${p.image_url || "https://placehold.co/160x160?text=Ürün"}" alt="">
+      <div>
+        <div class="title">${escapeHtml(p.title)}</div>
+        <div class="meta">${escapeHtml(p.source_store)} · ${p.quantity} adet</div>
+        <a href="${p.source_url}" target="_blank" rel="noopener">Ürünü aç</a>
+      </div>
+      <div class="right">
+        <div class="price">${money(p.source_price)}</div>
+        <div class="actions">
+          <input class="qty" type="number" min="1" max="99" value="${p.quantity}" data-id="${p.id}">
+          <button class="danger del" data-id="${p.id}">Sil</button>
+        </div>
+      </div>
+    `;
+    listEl.appendChild(el);
+  });
+
+  totalEl.textContent = money(total);
+  document.querySelectorAll(".del").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      await api("/api/products/" + btn.dataset.id, {method:"DELETE"});
+      load();
+    });
+  });
+  document.querySelectorAll(".qty").forEach(input => {
+    input.addEventListener("change", async () => {
+      await api(`/api/products/${input.dataset.id}/quantity?quantity=${input.value}`, {method:"PATCH"});
+      load();
+    });
+  });
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"
+  })[c]);
+}
+
+addBtn.addEventListener("click", async () => {
+  const url = urlEl.value.trim();
+  if (!url) return;
+  addBtn.disabled = true;
+  statusEl.textContent = "Ürün okunuyor...";
+  try {
+    await api("/api/products", {
+      method:"POST",
+      body: JSON.stringify({url, quantity:1})
+    });
+    urlEl.value = "";
+    statusEl.textContent = "Ürün eklendi.";
+    await load();
+  } catch (e) {
+    statusEl.textContent = e.message;
+  } finally {
+    addBtn.disabled = false;
+  }
+});
+
+urlEl.addEventListener("keydown", e => {
+  if (e.key === "Enter") addBtn.click();
+});
+
+load().catch(e => statusEl.textContent = e.message);
+</script>
+</body>
+</html>
