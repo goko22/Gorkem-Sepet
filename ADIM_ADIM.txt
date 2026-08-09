@@ -1,0 +1,11 @@
+V4 YUKLEME
+
+1. ZIP'i bilgisayarında çıkar.
+2. GitHub repo içindeki mevcut dosyaları v4 dosyalarıyla değiştir.
+3. Commit changes.
+4. Render mevcut Docker servisine gir.
+5. Manual Deploy > Deploy latest commit.
+6. /health aç.
+7. version = 4.0.0 gör.
+8. Aynı Hepsiburada linkini tekrar dene.
+9. Hata olursa Render Logs'ta isteğin olduğu andaki son 50 satırı gönder.
