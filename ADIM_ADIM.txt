@@ -1,0 +1,80 @@
+TUM SEPETIM V3 - ADIM ADIM
+
+1) GitHub reposundaki eski dosyalari sil.
+
+2) Bu ZIP'i bilgisayarinda CIKART.
+
+3) GitHub reposuna gir:
+   Add file > Upload files
+
+4) ZIP'in ICINDEKI tum dosyalari secip GitHub'a surukle.
+   ZIP'in kendisini yukleme.
+
+5) Repo kokunde sunlari gormelisin:
+   Dockerfile
+   requirements.txt
+   main.py
+   database.py
+   models.py
+   schemas.py
+   services.py
+   scraper.py
+   utils.py
+   index.html
+   README.md
+   ADIM_ADIM.txt
+   .dockerignore
+   .env.example
+
+6) Commit changes.
+
+7) Render'a gir.
+
+8) Mevcut Python Web Service yerine yeni bir Web Service olusturmak daha temiz:
+   New > Web Service
+
+9) GitHub reposunu sec.
+
+10) Language / Runtime:
+    Docker
+
+11) Dockerfile Path:
+    ./Dockerfile
+
+12) Build Command:
+    BOS BIRAK
+
+13) Start Command:
+    BOS BIRAK
+    Dockerfile zaten uvicorn baslatiyor.
+
+14) Environment Variables:
+    DATABASE_URL = PostgreSQL Internal Database URL
+
+15) Health Check Path:
+    /health
+
+16) Instance:
+    Free varsa Free sec.
+
+17) Create Web Service.
+
+18) Deploy logunda sunlari bekle:
+    Uvicorn running on http://0.0.0.0:10000
+    Application startup complete
+
+19) Siteyi ac.
+
+20) Once /health test et:
+    https://SENIN-SITEN.onrender.com/health
+
+    Sunu gormelisin:
+    {"ok":true,"service":"tum-sepetim","version":"3.0.0"}
+
+21) Sonra Hepsiburada linkini ekle.
+    HTTP 403 olursa sistem Chromium fallback deneyecek.
+
+22) Amazon Türkiye linkiyle de test et.
+
+HATA OLURSA:
+Render Deploy Logs'un EN ALTTAKI 30-50 satirini ChatGPT'ye gonder.
