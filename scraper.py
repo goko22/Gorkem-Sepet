@@ -730,9 +730,7 @@ def extract_hepsiburada_code(
     return None
 
 
-async def scrape_hepsiburada_api(
-    url,
-):
+async def scrape_hepsiburada_api(url):
     api_key = os.getenv(
         "PARSE_API_KEY"
     )
@@ -783,7 +781,7 @@ async def scrape_hepsiburada_api(
         )
 
         print(
-            "HEPSIBURADA DETAILS STATUS:",
+            "HB DETAILS STATUS:",
             response.status_code,
             flush=True,
         )
@@ -791,39 +789,6 @@ async def scrape_hepsiburada_api(
         response.raise_for_status()
 
         payload = response.json()
-
-        # =================================================
-        # TEST İÇİN TAM API LOGU
-        # =================================================
-
-        print(
-            "========== HEPSIBURADA RAW START ==========",
-            flush=True,
-        )
-
-        print(
-            "HB REQUEST URL:",
-            url,
-            flush=True,
-        )
-
-        print(
-            "HB PAYLOAD TYPE:",
-            type(payload).__name__,
-            flush=True,
-        )
-
-        if isinstance(
-            payload,
-            dict,
-        ):
-            print(
-                "HB TOP LEVEL KEYS:",
-                list(
-                    payload.keys()
-                ),
-                flush=True,
-            )
 
         data = (
             payload.get(
@@ -836,67 +801,6 @@ async def scrape_hepsiburada_api(
             )
             else payload
         )
-
-        if isinstance(
-            data,
-            list,
-        ):
-            print(
-                "HB DATA LIST LENGTH:",
-                len(data),
-                flush=True,
-            )
-
-            if data:
-                print(
-                    "HB FIRST ITEM:",
-                    json.dumps(
-                        data[0],
-                        ensure_ascii=False,
-                        default=str,
-                        indent=2,
-                    ),
-                    flush=True,
-                )
-
-        elif isinstance(
-            data,
-            dict,
-        ):
-            print(
-                "HB DATA KEYS:",
-                list(
-                    data.keys()
-                ),
-                flush=True,
-            )
-
-            print(
-                "HB DATA:",
-                json.dumps(
-                    data,
-                    ensure_ascii=False,
-                    default=str,
-                    indent=2,
-                ),
-                flush=True,
-            )
-
-        else:
-            print(
-                "HB DATA VALUE:",
-                repr(data),
-                flush=True,
-            )
-
-        print(
-            "========== HEPSIBURADA RAW END ==========",
-            flush=True,
-        )
-
-        # =================================================
-        # LIST ISE ILK URUNU AL
-        # =================================================
 
         if isinstance(
             data,
@@ -918,35 +822,6 @@ async def scrape_hepsiburada_api(
             )
 
         # =================================================
-        # EXTRA FIYAT ALANLARINI DA LOGA BAS
-        # =================================================
-
-        print(
-            "HB POSSIBLE PRICE FIELDS:",
-            {
-                key: value
-                for key, value
-                in data.items()
-                if any(
-                    word in key.lower()
-                    for word in [
-                        "price",
-                        "discount",
-                        "basket",
-                        "cart",
-                        "campaign",
-                        "sale",
-                        "special",
-                        "final",
-                        "merchant",
-                        "promotion",
-                    ]
-                )
-            },
-            flush=True,
-        )
-
-        # =================================================
         # TITLE
         # =================================================
 
@@ -956,44 +831,52 @@ async def scrape_hepsiburada_api(
             or data.get("title")
         )
 
-        # =================================================
-        # ŞİMDİLİK NORMAL FIYAT
-        #
-        # RAW LOGU GÖRDÜKTEN SONRA
-        # SEPET FIYATI VARSA BURAYI DEGISTIRECEGIZ.
-        # =================================================
-
-        price = clean_price(
-            data.get("unit_price")
-            or data.get("price")
-            or data.get("current_price")
-            or data.get("sale_price")
-        )
-
-        brand = (
-            data.get("brand")
-            or data.get("brand_name")
-        )
-
-        model = (
-            data.get("sku")
-            or data.get("productId")
-            or data.get("product_id")
-            or product_code
-        )
-
         if not title:
             raise RuntimeError(
                 "Hepsiburada ürün adı alınamadı."
             )
 
-        if price is None:
-            raise RuntimeError(
-                "Hepsiburada fiyat alınamadı."
+        # =================================================
+        # FİYAT
+        #
+        # unit_price     -> güncel / indirimli fiyat
+        # original_price -> eski / normal fiyat
+        # =================================================
+
+        discounted_price = clean_price(
+            data.get(
+                "unit_price"
+            )
+        )
+
+        original_price = clean_price(
+            data.get(
+                "original_price"
+            )
+        )
+
+        # Ek fallback alanları
+        if discounted_price is None:
+            discounted_price = clean_price(
+                data.get(
+                    "sale_price"
+                )
+                or data.get(
+                    "current_price"
+                )
+                or data.get(
+                    "discounted_price"
+                )
+                or data.get(
+                    "price"
+                )
             )
 
         # =================================================
-        # IMAGE
+        # SEARCH ENDPOINT
+        #
+        # Arama sonucundaki fiyat daha düşükse,
+        # exact ürün/satıcı eşleşmesinde onu da dikkate al.
         # =================================================
 
         image_url = (
@@ -1002,144 +885,228 @@ async def scrape_hepsiburada_api(
             or data.get("image")
         )
 
-        if not image_url:
-            try:
-                search_response = await client.get(
-                    f"{base_url}/search_products",
-                    headers=headers,
-                    params={
-                        "page": 1,
-                        "query": title,
-                    },
+        brand = (
+            data.get("brand")
+            or data.get(
+                "brand_name"
+            )
+        )
+
+        model = (
+            data.get("sku")
+            or data.get(
+                "productId"
+            )
+            or data.get(
+                "product_id"
+            )
+            or product_code
+        )
+
+        search_price = None
+
+        try:
+            search_response = await client.get(
+                f"{base_url}/search_products",
+                headers=headers,
+                params={
+                    "page": 1,
+                    "query": title,
+                },
+            )
+
+            print(
+                "HB SEARCH STATUS:",
+                search_response.status_code,
+                flush=True,
+            )
+
+            if (
+                search_response.status_code
+                == 200
+            ):
+                search_payload = (
+                    search_response.json()
                 )
 
-                print(
-                    "HEPSIBURADA SEARCH STATUS:",
-                    search_response.status_code,
-                    flush=True,
+                search_data = (
+                    search_payload.get(
+                        "data",
+                        search_payload,
+                    )
+                    if isinstance(
+                        search_payload,
+                        dict,
+                    )
+                    else search_payload
                 )
 
-                if (
-                    search_response.status_code
-                    == 200
+                products = []
+
+                if isinstance(
+                    search_data,
+                    dict,
                 ):
-                    search_payload = (
-                        search_response.json()
+                    products = (
+                        search_data.get(
+                            "products",
+                            [],
+                        )
                     )
 
-                    search_data = (
-                        search_payload.get(
-                            "data",
-                            search_payload,
-                        )
-                        if isinstance(
-                            search_payload,
-                            dict,
-                        )
-                        else search_payload
-                    )
+                elif isinstance(
+                    search_data,
+                    list,
+                ):
+                    products = search_data
 
+                if not isinstance(
+                    products,
+                    list,
+                ):
                     products = []
 
-                    if isinstance(
-                        search_data,
+                details_product_id = str(
+                    data.get(
+                        "product_id"
+                    )
+                    or data.get(
+                        "productId"
+                    )
+                    or ""
+                ).upper()
+
+                best_item = None
+                best_score = -1
+
+                # URL'deki satıcı
+                parsed_query = parse_qs(
+                    urlparse(
+                        url
+                    ).query
+                )
+
+                requested_merchant = (
+                    parsed_query.get(
+                        "magaza",
+                        [None],
+                    )[0]
+                )
+
+                requested_merchant_norm = (
+                    normalize_text(
+                        requested_merchant
+                    )
+                    if requested_merchant
+                    else ""
+                )
+
+                for item in products:
+                    if not isinstance(
+                        item,
                         dict,
                     ):
-                        products = (
-                            search_data.get(
-                                "products",
-                                [],
-                            )
+                        continue
+
+                    item_name = (
+                        item.get("name")
+                        or item.get(
+                            "product_name"
                         )
+                        or ""
+                    )
 
-                    elif isinstance(
-                        search_data,
-                        list,
-                    ):
-                        products = search_data
+                    score = (
+                        similarity(
+                            title,
+                            item_name,
+                        )
+                        * 50
+                    )
 
-                    if not isinstance(
-                        products,
-                        list,
-                    ):
-                        products = []
-
-                    best_item = None
-                    best_score = -1
-
-                    details_product_id = str(
-                        data.get("product_id")
-                        or data.get("productId")
+                    item_sku = str(
+                        item.get("sku")
                         or ""
                     ).upper()
 
-                    for item in products:
-                        if not isinstance(
-                            item,
-                            dict,
-                        ):
-                            continue
-
-                        item_name = (
-                            item.get("name")
-                            or item.get(
-                                "product_name"
-                            )
-                            or ""
+                    item_product_id = str(
+                        item.get(
+                            "productId"
                         )
-
-                        score = (
-                            similarity(
-                                title,
-                                item_name,
-                            )
-                            * 50
+                        or item.get(
+                            "product_id"
                         )
+                        or ""
+                    ).upper()
 
-                        item_sku = str(
-                            item.get("sku")
-                            or ""
-                        ).upper()
+                    if (
+                        item_sku
+                        == product_code
+                    ):
+                        score += 150
 
-                        item_product_id = str(
-                            item.get("productId")
-                            or item.get(
-                                "product_id"
-                            )
-                            or ""
-                        ).upper()
+                    if (
+                        details_product_id
+                        and
+                        item_product_id
+                        == details_product_id
+                    ):
+                        score += 150
 
-                        if (
-                            item_sku
-                            == product_code
-                        ):
-                            score += 100
-
-                        if (
-                            details_product_id
-                            and item_product_id
-                            == details_product_id
-                        ):
-                            score += 100
-
-                        item_price = clean_price(
-                            item.get("price")
+                    merchant_name = (
+                        item.get(
+                            "merchantName"
                         )
+                        or item.get(
+                            "merchant_name"
+                        )
+                        or item.get(
+                            "seller"
+                        )
+                        or ""
+                    )
 
-                        if (
-                            item_price is not None
-                            and abs(
-                                item_price
-                                - price
-                            ) < 0.01
-                        ):
-                            score += 30
+                    if (
+                        requested_merchant_norm
+                        and
+                        normalize_text(
+                            merchant_name
+                        )
+                        ==
+                        requested_merchant_norm
+                    ):
+                        score += 100
 
-                        if score > best_score:
-                            best_score = score
-                            best_item = item
+                    candidate_price = clean_price(
+                        item.get(
+                            "price"
+                        )
+                        or item.get(
+                            "priceText"
+                        )
+                    )
 
-                    if best_item:
+                    if (
+                        candidate_price
+                        is not None
+                    ):
+                        score += 5
+
+                    if score > best_score:
+                        best_score = score
+                        best_item = item
+
+                if best_item:
+                    search_price = clean_price(
+                        best_item.get(
+                            "price"
+                        )
+                        or best_item.get(
+                            "priceText"
+                        )
+                    )
+
+                    if not image_url:
                         image_url = (
                             best_item.get(
                                 "imageUrl"
@@ -1152,56 +1119,140 @@ async def scrape_hepsiburada_api(
                             )
                         )
 
-            except Exception as e:
-                print(
-                    "HEPSIBURADA IMAGE ERROR:",
-                    repr(e),
-                    flush=True,
-                )
+                    print(
+                        "HB SEARCH MATCH:",
+                        best_item.get(
+                            "merchantName"
+                        ),
+                        search_price,
+                        flush=True,
+                    )
 
-        variants = query_variants(
-            url
-        )
-
-        variant_text = (
-            make_variant_text(
-                variants
+        except Exception as e:
+            print(
+                "HB SEARCH ERROR:",
+                repr(e),
+                flush=True,
             )
+
+        # =================================================
+        # EN İYİ GÜNCEL FİYATI SEÇ
+        # =================================================
+
+        valid_prices = [
+            p
+            for p in [
+                discounted_price,
+                search_price,
+            ]
+            if (
+                p is not None
+                and p > 0
+            )
+        ]
+
+        if valid_prices:
+            price = min(
+                valid_prices
+            )
+        else:
+            price = (
+                original_price
+            )
+
+        if price is None:
+            raise RuntimeError(
+                "Hepsiburada fiyat alınamadı."
+            )
+
+        # Saçma veri koruması:
+        # original_price varsa indirimli
+        # fiyat ondan büyük olmamalı.
+        if (
+            original_price is not None
+            and
+            price > original_price
+        ):
+            price = (
+                original_price
+            )
+
+        print(
+            "==============================",
+            flush=True,
         )
 
         print(
-            "HEPSIBURADA FINAL TITLE:",
+            "HB TITLE:",
             title,
             flush=True,
         )
 
         print(
-            "HEPSIBURADA FINAL PRICE:",
+            "HB DISCOUNTED:",
+            discounted_price,
+            flush=True,
+        )
+
+        print(
+            "HB ORIGINAL:",
+            original_price,
+            flush=True,
+        )
+
+        print(
+            "HB SEARCH PRICE:",
+            search_price,
+            flush=True,
+        )
+
+        print(
+            "HB FINAL PRICE:",
             price,
             flush=True,
         )
 
         print(
-            "HEPSIBURADA FINAL IMAGE:",
-            image_url,
+            "==============================",
             flush=True,
+        )
+
+        variants = (
+            query_variants(
+                url
+            )
         )
 
         return ScrapedProduct(
             title=title[:500],
-            store="Hepsiburada",
-            url=url,
-            price=price,
-            image_url=normalize_image_url(
-                image_url
-            ),
-            brand=brand,
-            model=model,
-            variants=variants,
-            variant_text=variant_text,
-            method="parse-api",
-        )
 
+            store="Hepsiburada",
+
+            url=url,
+
+            # Sepette hesaplanan fiyat
+            # bu olacak.
+            price=price,
+
+            image_url=
+                normalize_image_url(
+                    image_url
+                ),
+
+            brand=brand,
+
+            model=model,
+
+            variants=variants,
+
+            variant_text=
+                make_variant_text(
+                    variants
+                ),
+
+            method=
+                "parse-api-discount",
+        )
 
 # =========================================================
 # GENEL SHOPIFY
