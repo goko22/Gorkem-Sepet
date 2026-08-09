@@ -1,0 +1,982 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8">
+
+  <meta
+    name="viewport"
+    content="width=device-width,initial-scale=1"
+  >
+
+  <title>Tüm Sepetim</title>
+
+  <style>
+    *{
+      box-sizing:border-box;
+    }
+
+    body{
+      margin:0;
+      background:#0a0f16;
+      color:#edf3f8;
+      font-family:Arial,system-ui,sans-serif;
+    }
+
+    .wrap{
+      max-width:1120px;
+      margin:auto;
+      padding:30px 18px 70px;
+    }
+
+    h1{
+      margin:0;
+      font-size:34px;
+    }
+
+    .sub{
+      color:#91a0b2;
+      margin:8px 0 24px;
+    }
+
+    .panel,
+    .stat,
+    .product{
+      background:#111925;
+      border:1px solid #243247;
+      border-radius:16px;
+    }
+
+    .panel{
+      padding:16px;
+      margin-bottom:18px;
+    }
+
+    .add{
+      display:grid;
+      grid-template-columns:1fr auto;
+      gap:10px;
+    }
+
+    input,
+    button{
+      border-radius:10px;
+      border:1px solid #304159;
+      padding:12px 13px;
+      font-size:15px;
+    }
+
+    input{
+      background:#0b121c;
+      color:#fff;
+    }
+
+    button{
+      background:#52d69a;
+      color:#062016;
+      font-weight:700;
+      cursor:pointer;
+    }
+
+    button:disabled{
+      opacity:.55;
+      cursor:wait;
+    }
+
+    .danger{
+      background:#35151c;
+      color:#ff8490;
+      border-color:#57232d;
+    }
+
+    .status{
+      color:#a0adbb;
+      min-height:22px;
+      margin-top:10px;
+    }
+
+    .summary{
+      display:grid;
+      grid-template-columns:repeat(3,1fr);
+      gap:12px;
+      margin-bottom:18px;
+    }
+
+    .stat{
+      padding:14px;
+    }
+
+    .stat small{
+      color:#91a0b2;
+    }
+
+    .stat strong{
+      display:block;
+      font-size:24px;
+      margin-top:5px;
+    }
+
+    .list{
+      display:grid;
+      gap:10px;
+    }
+
+    .product{
+      padding:13px;
+      display:grid;
+      grid-template-columns:86px 1fr auto;
+      gap:14px;
+      align-items:center;
+    }
+
+    .thumb{
+      width:86px;
+      height:86px;
+      object-fit:contain;
+      background:#fff;
+      border-radius:10px;
+    }
+
+    .title{
+      font-weight:700;
+      margin-bottom:7px;
+    }
+
+    .meta{
+      font-size:14px;
+      color:#91a0b2;
+      margin-bottom:5px;
+    }
+
+    .variant{
+      display:inline-block;
+      font-size:13px;
+      color:#d8e6f5;
+      background:#182435;
+      border:1px solid #2c4059;
+      padding:6px 9px;
+      border-radius:8px;
+      margin:2px 0 8px;
+      line-height:1.35;
+    }
+
+    .price{
+      font-size:22px;
+      font-weight:800;
+      color:#72e7af;
+      text-align:right;
+    }
+
+    .unit-price{
+      font-size:12px;
+      color:#91a0b2;
+      text-align:right;
+      margin-top:4px;
+    }
+
+    .actions{
+      display:flex;
+      gap:7px;
+      justify-content:flex-end;
+      margin-top:9px;
+      align-items:center;
+    }
+
+    .actions button{
+      padding:7px 10px;
+      font-size:14px;
+    }
+
+    .qty-button{
+      min-width:34px;
+      background:#192638;
+      border-color:#31465f;
+      color:#eaf5ff;
+    }
+
+    .qty{
+      width:55px;
+      text-align:center;
+      padding:7px 5px;
+    }
+
+    a{
+      color:#8fc2ff;
+      text-decoration:none;
+    }
+
+    .empty{
+      text-align:center;
+      color:#91a0b2;
+      padding:30px;
+    }
+
+    @media(max-width:700px){
+      .summary{
+        grid-template-columns:1fr;
+      }
+
+      .add{
+        grid-template-columns:1fr;
+      }
+
+      .product{
+        grid-template-columns:68px 1fr;
+      }
+
+      .thumb{
+        width:68px;
+        height:68px;
+      }
+
+      .right{
+        grid-column:1/-1;
+      }
+
+      .price,
+      .unit-price{
+        text-align:left;
+      }
+
+      .actions{
+        justify-content:flex-start;
+      }
+    }
+  </style>
+</head>
+
+<body>
+
+<main class="wrap">
+
+  <h1>Tüm Sepetim</h1>
+
+  <div class="sub">
+    Tüm mağazalardaki ürünlerini tek sepette takip et.
+  </div>
+
+
+  <section class="panel">
+
+    <div class="add">
+
+      <input
+        id="url"
+        type="url"
+        placeholder="Ürün linkini yapıştır"
+      >
+
+      <button id="addBtn">
+        Sepete ekle
+      </button>
+
+    </div>
+
+    <div
+      id="status"
+      class="status"
+    ></div>
+
+  </section>
+
+
+  <section class="summary">
+
+    <div class="stat">
+      <small>Ürün çeşidi</small>
+      <strong id="count">0</strong>
+    </div>
+
+    <div class="stat">
+      <small>Toplam ürün</small>
+      <strong id="quantityTotal">0</strong>
+    </div>
+
+    <div class="stat">
+      <small>Sepet toplamı</small>
+      <strong id="total">₺0,00</strong>
+    </div>
+
+  </section>
+
+
+  <section
+    id="list"
+    class="list"
+  ></section>
+
+</main>
+
+
+<script>
+
+const listEl =
+  document.getElementById("list");
+
+const statusEl =
+  document.getElementById("status");
+
+const urlEl =
+  document.getElementById("url");
+
+const addBtn =
+  document.getElementById("addBtn");
+
+const countEl =
+  document.getElementById("count");
+
+const totalEl =
+  document.getElementById("total");
+
+const quantityTotalEl =
+  document.getElementById(
+    "quantityTotal"
+  );
+
+
+let currentProducts = [];
+
+const quantityTimers =
+  new Map();
+
+
+const money = n =>
+  n == null
+    ? "Fiyat alınamadı"
+    : new Intl.NumberFormat(
+        "tr-TR",
+        {
+          style:"currency",
+          currency:"TRY"
+        }
+      ).format(n);
+
+
+function esc(v){
+
+  return String(v ?? "")
+    .replace(
+      /[&<>"']/g,
+      c => ({
+        "&":"&amp;",
+        "<":"&lt;",
+        ">":"&gt;",
+        '"':"&quot;",
+        "'":"&#39;"
+      }[c])
+    );
+}
+
+
+async function api(
+  path,
+  options={}
+){
+
+  const r = await fetch(
+    path,
+    {
+      headers:{
+        "Content-Type":
+          "application/json"
+      },
+      ...options
+    }
+  );
+
+  const data =
+    await r.json()
+    .catch(
+      () => ({})
+    );
+
+  if(!r.ok){
+
+    throw new Error(
+      data.detail
+      || "İşlem başarısız."
+    );
+  }
+
+  return data;
+}
+
+
+async function load(){
+
+  const products =
+    await api(
+      "/api/products"
+    );
+
+  currentProducts =
+    products;
+
+  render();
+}
+
+
+function render(){
+
+  const products =
+    currentProducts;
+
+  listEl.innerHTML = "";
+
+  countEl.textContent =
+    products.length;
+
+
+  let total = 0;
+  let totalQuantity = 0;
+
+
+  if(!products.length){
+
+    listEl.innerHTML =
+      '<div class="empty">'
+      + 'Sepetin boş. Yukarıya bir ürün linki yapıştır.'
+      + '</div>';
+  }
+
+
+  for(const p of products){
+
+    const quantity =
+      Number(p.quantity || 1);
+
+    const unitPrice =
+      p.source_price == null
+        ? null
+        : Number(
+            p.source_price
+          );
+
+    const productTotal =
+      unitPrice == null
+        ? null
+        : unitPrice * quantity;
+
+
+    totalQuantity +=
+      quantity;
+
+
+    if(productTotal != null){
+
+      total +=
+        productTotal;
+    }
+
+
+    const el =
+      document.createElement(
+        "article"
+      );
+
+    el.className =
+      "product";
+
+
+    const variantHtml =
+      p.variant_text
+        ? `
+          <div class="variant">
+            ${esc(p.variant_text)}
+          </div>
+        `
+        : "";
+
+
+    const unitHtml =
+      unitPrice != null
+      && quantity > 1
+        ? `
+          <div class="unit-price">
+            ${quantity}
+            ×
+            ${money(unitPrice)}
+          </div>
+        `
+        : "";
+
+
+    el.innerHTML = `
+
+      <img
+        class="thumb"
+        src="${esc(
+          p.image_url || ""
+        )}"
+        alt=""
+        onerror="
+          this.style.visibility='hidden'
+        "
+      >
+
+
+      <div>
+
+        <div class="title">
+          ${esc(p.title)}
+        </div>
+
+        <div class="meta">
+          ${esc(p.source_store)}
+          ·
+          ${quantity} adet
+        </div>
+
+        ${variantHtml}
+
+        <div>
+          <a
+            href="${esc(
+              p.source_url
+            )}"
+            target="_blank"
+            rel="noopener"
+          >
+            Mağazada aç
+          </a>
+        </div>
+
+      </div>
+
+
+      <div class="right">
+
+        <div class="price">
+          ${money(productTotal)}
+        </div>
+
+        ${unitHtml}
+
+        <div class="actions">
+
+          <button
+            class="qty-button minus"
+            data-id="${p.id}"
+            type="button"
+          >
+            −
+          </button>
+
+
+          <input
+            class="qty"
+            type="number"
+            min="1"
+            max="99"
+            value="${quantity}"
+            data-id="${p.id}"
+          >
+
+
+          <button
+            class="qty-button plus"
+            data-id="${p.id}"
+            type="button"
+          >
+            +
+          </button>
+
+
+          <button
+            class="danger del"
+            data-id="${p.id}"
+            type="button"
+          >
+            Sil
+          </button>
+
+        </div>
+
+      </div>
+    `;
+
+
+    listEl.appendChild(
+      el
+    );
+  }
+
+
+  totalEl.textContent =
+    money(total);
+
+
+  quantityTotalEl.textContent =
+    totalQuantity;
+
+
+  bindButtons();
+}
+
+
+function getProduct(id){
+
+  return currentProducts.find(
+    p =>
+      String(p.id)
+      === String(id)
+  );
+}
+
+
+function queueQuantityUpdate(
+  id,
+  newQuantity
+){
+
+  const p =
+    getProduct(id);
+
+  if(!p){
+    return;
+  }
+
+
+  newQuantity =
+    Math.max(
+      1,
+      Math.min(
+        99,
+        Number(newQuantity) || 1
+      )
+    );
+
+
+  // Ekranda ANINDA değiştir.
+  p.quantity =
+    newQuantity;
+
+  render();
+
+
+  if(
+    quantityTimers.has(id)
+  ){
+    clearTimeout(
+      quantityTimers.get(id)
+    );
+  }
+
+
+  const timer =
+    setTimeout(
+      async () => {
+
+        quantityTimers.delete(
+          id
+        );
+
+        try{
+
+          await api(
+            `/api/products/${id}/quantity`
+            + `?quantity=${newQuantity}`,
+            {
+              method:"PATCH"
+            }
+          );
+
+        }catch(e){
+
+          statusEl.textContent =
+            e.message;
+
+          // Sunucudaki gerçek
+          // değeri tekrar çek.
+          await load()
+            .catch(
+              () => {}
+            );
+        }
+
+      },
+      250
+    );
+
+
+  quantityTimers.set(
+    id,
+    timer
+  );
+}
+
+
+function bindButtons(){
+
+  document
+    .querySelectorAll(
+      ".del"
+    )
+    .forEach(
+      btn => {
+
+        btn.addEventListener(
+          "click",
+          async () => {
+
+            try{
+
+              await api(
+                "/api/products/"
+                + btn.dataset.id,
+                {
+                  method:"DELETE"
+                }
+              );
+
+              await load();
+
+            }catch(e){
+
+              statusEl.textContent =
+                e.message;
+            }
+          }
+        );
+      }
+    );
+
+
+  document
+    .querySelectorAll(
+      ".plus"
+    )
+    .forEach(
+      btn => {
+
+        btn.addEventListener(
+          "click",
+          () => {
+
+            const p =
+              getProduct(
+                btn.dataset.id
+              );
+
+            if(!p){
+              return;
+            }
+
+            queueQuantityUpdate(
+              p.id,
+              Number(
+                p.quantity
+              ) + 1
+            );
+          }
+        );
+      }
+    );
+
+
+  document
+    .querySelectorAll(
+      ".minus"
+    )
+    .forEach(
+      btn => {
+
+        btn.addEventListener(
+          "click",
+          () => {
+
+            const p =
+              getProduct(
+                btn.dataset.id
+              );
+
+            if(!p){
+              return;
+            }
+
+            queueQuantityUpdate(
+              p.id,
+              Number(
+                p.quantity
+              ) - 1
+            );
+          }
+        );
+      }
+    );
+
+
+  document
+    .querySelectorAll(
+      ".qty"
+    )
+    .forEach(
+      inp => {
+
+        inp.addEventListener(
+          "change",
+          () => {
+
+            queueQuantityUpdate(
+              inp.dataset.id,
+              inp.value
+            );
+          }
+        );
+      }
+    );
+}
+
+
+function startCountdown(){
+
+  let remaining =
+    10;
+
+
+  statusEl.textContent =
+    `Ürün kontrol ediliyor • ${remaining} sn`;
+
+
+  const interval =
+    setInterval(
+      () => {
+
+        remaining -= 1;
+
+
+        if(remaining > 0){
+
+          statusEl.textContent =
+            `Ürün kontrol ediliyor • ${remaining} sn`;
+
+        }else{
+
+          statusEl.textContent =
+            "Son kontroller yapılıyor...";
+
+          clearInterval(
+            interval
+          );
+        }
+
+      },
+      1000
+    );
+
+
+  return () => {
+
+    clearInterval(
+      interval
+    );
+  };
+}
+
+
+async function add(){
+
+  const url =
+    urlEl.value.trim();
+
+
+  if(!url){
+
+    statusEl.textContent =
+      "Önce ürün linki yapıştır.";
+
+    return;
+  }
+
+
+  addBtn.disabled =
+    true;
+
+
+  const stopCountdown =
+    startCountdown();
+
+
+  try{
+
+    const product =
+      await api(
+        "/api/products",
+        {
+          method:"POST",
+
+          body:JSON.stringify(
+            {
+              url,
+              quantity:1
+            }
+          )
+        }
+      );
+
+
+    urlEl.value =
+      "";
+
+
+    stopCountdown();
+
+
+    if(product.variant_text){
+
+      statusEl.textContent =
+        "Ürün sepete eklendi • "
+        + product.variant_text;
+
+    }else{
+
+      statusEl.textContent =
+        "Ürün ve fiyat sepete eklendi.";
+    }
+
+
+    await load();
+
+
+  }catch(e){
+
+    stopCountdown();
+
+    statusEl.textContent =
+      e.message;
+
+
+  }finally{
+
+    addBtn.disabled =
+      false;
+  }
+}
+
+
+addBtn.addEventListener(
+  "click",
+  add
+);
+
+
+urlEl.addEventListener(
+  "keydown",
+  e => {
+
+    if(e.key === "Enter"){
+      add();
+    }
+  }
+);
+
+
+load().catch(
+  e =>
+    statusEl.textContent =
+      e.message
+);
+
+</script>
+
+</body>
+</html>
