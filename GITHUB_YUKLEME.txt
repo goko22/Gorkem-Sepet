@@ -1,0 +1,17 @@
+1. Eski GitHub repo dosyalarını sil.
+2. Bu ZIP'i bilgisayarında ÇIKART.
+3. GitHub > Add file > Upload files.
+4. ZIP'in içindeki DOSYALARIN TAMAMINI sürükle.
+5. Klasör yok; tüm dosyalar GitHub ana sayfasında görünmeli.
+6. Commit changes.
+
+Render:
+Build Command:
+pip install -r requirements.txt
+
+Start Command:
+uvicorn main:app --host 0.0.0.0 --port $PORT
+
+Environment Variables:
+PYTHON_VERSION = 3.13.5
+DATABASE_URL = PostgreSQL bağlantı URL'in
