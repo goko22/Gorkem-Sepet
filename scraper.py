@@ -3,7 +3,6 @@ import os
 import re
 from dataclasses import dataclass
 from typing import Optional
-from urllib.parse import quote
 
 import httpx
 from bs4 import BeautifulSoup
@@ -22,6 +21,10 @@ HEADERS = {
         "Chrome/124.0.0.0 Safari/537.36"
     ),
     "Accept-Language": "tr-TR,tr;q=0.9,en;q=0.8",
+    "Accept": (
+        "text/html,application/xhtml+xml,"
+        "application/xml;q=0.9,*/*;q=0.8"
+    ),
 }
 
 
@@ -46,14 +49,18 @@ def clean_price(value):
         return None
 
     if isinstance(value, (int, float)):
-        value = float(value)
-        return value if value > 0 else None
+        number = float(value)
+        return number if number > 0 else None
 
     text = str(value).strip()
+
+    if not text:
+        return None
 
     patterns = [
         r"(\d{1,3}(?:\.\d{3})+,\d{1,2})",
         r"(\d+,\d{1,2})",
+        r"(\d{1,3}(?:,\d{3})+\.\d{1,2})",
         r"(\d+\.\d{1,2})",
         r"(\d+)",
     ]
@@ -67,13 +74,19 @@ def clean_price(value):
         raw = match.group(1)
 
         try:
-            if "," in raw:
+            if "." in raw and "," in raw:
+                if raw.rfind(",") > raw.rfind("."):
+                    raw = raw.replace(".", "").replace(",", ".")
+                else:
+                    raw = raw.replace(",", "")
+
+            elif "," in raw:
                 raw = raw.replace(".", "").replace(",", ".")
 
-            value = float(raw)
+            number = float(raw)
 
-            if 0 < value < 100_000_000:
-                return value
+            if 0 < number < 100_000_000:
+                return number
 
         except Exception:
             pass
@@ -107,8 +120,21 @@ def walk_for_product(data):
     return None
 
 
+def extract_hepsiburada_code(url: str):
+    match = re.search(
+        r"(HBCV[A-Z0-9]+|HBC[A-Z0-9]+)",
+        url,
+        re.I,
+    )
+
+    if match:
+        return match.group(1).upper()
+
+    return None
+
+
 # =========================================================
-# HEPSIBURADA - PARSE.BOT
+# HEPSIBURADA - PARSE API
 # =========================================================
 
 async def scrape_hepsiburada_api(url: str) -> ScrapedProduct:
@@ -117,6 +143,13 @@ async def scrape_hepsiburada_api(url: str) -> ScrapedProduct:
     if not api_key:
         raise RuntimeError(
             "PARSE_API_KEY Render Environment Variables içinde tanımlı değil."
+        )
+
+    product_code = extract_hepsiburada_code(url)
+
+    if not product_code:
+        raise RuntimeError(
+            "Hepsiburada ürün kodu URL içinden bulunamadı."
         )
 
     endpoint = (
@@ -130,49 +163,98 @@ async def scrape_hepsiburada_api(url: str) -> ScrapedProduct:
         "Accept": "application/json",
     }
 
-    params = {
-        "product": url
-    }
+    param_candidates = [
+        {
+            "product_id": product_code
+        },
+        {
+            "sku": product_code
+        },
+        {
+            "url": url
+        },
+        {
+            "product_url": url
+        },
+    ]
+
+    payload = None
+    last_status = None
+    last_body = None
 
     async with httpx.AsyncClient(
-        timeout=40,
+        timeout=45,
         follow_redirects=True,
     ) as client:
 
-        response = await client.get(
-            endpoint,
-            headers=headers,
-            params=params,
-        )
-
-        print(
-            "PARSE HB STATUS:",
-            response.status_code,
-        )
-
-        if response.status_code >= 400:
+        for params in param_candidates:
             print(
-                "PARSE HB BODY:",
-                response.text[:2000],
+                "HEPSIBURADA PARSE TRY:",
+                params,
             )
 
-        response.raise_for_status()
+            response = await client.get(
+                endpoint,
+                headers=headers,
+                params=params,
+            )
 
-        payload = response.json()
+            last_status = response.status_code
+            last_body = response.text[:3000]
+
+            print(
+                "HEPSIBURADA PARSE STATUS:",
+                response.status_code,
+            )
+
+            print(
+                "HEPSIBURADA PARSE BODY:",
+                last_body,
+            )
+
+            if response.status_code == 200:
+                try:
+                    payload = response.json()
+                    break
+                except Exception as e:
+                    raise RuntimeError(
+                        f"Parse API JSON cevabı okunamadı: {e}"
+                    )
+
+            if response.status_code == 422:
+                continue
+
+            if response.status_code == 429:
+                raise RuntimeError(
+                    "Parse API rate limit doldu. Birkaç dakika sonra tekrar dene."
+                )
+
+            if response.status_code == 401:
+                raise RuntimeError(
+                    "PARSE_API_KEY geçersiz veya yetkisiz."
+                )
+
+            if response.status_code == 403:
+                raise RuntimeError(
+                    "Parse API erişimi reddetti. API key/plan kontrol edilmeli."
+                )
+
+            response.raise_for_status()
+
+    if payload is None:
+        raise RuntimeError(
+            "Hepsiburada API hiçbir parametreyi kabul etmedi. "
+            f"Son durum: {last_status}. "
+            f"Cevap: {last_body}"
+        )
 
     print(
-        "PARSE HB RESPONSE:",
+        "HEPSIBURADA PARSE SUCCESS:",
         json.dumps(
             payload,
             ensure_ascii=False,
-        )[:4000],
+        )[:5000],
     )
-
-    # Parse response genelde:
-    # {
-    #   "status": "success",
-    #   "data": {...}
-    # }
 
     data = payload.get("data", payload)
 
@@ -181,11 +263,12 @@ async def scrape_hepsiburada_api(url: str) -> ScrapedProduct:
             raise RuntimeError(
                 "Hepsiburada API boş sonuç döndürdü."
             )
+
         data = data[0]
 
     if not isinstance(data, dict):
         raise RuntimeError(
-            "Hepsiburada API beklenmeyen cevap döndürdü."
+            "Hepsiburada API beklenmeyen veri tipi döndürdü."
         )
 
     title = (
@@ -198,6 +281,8 @@ async def scrape_hepsiburada_api(url: str) -> ScrapedProduct:
         data.get("unit_price")
         or data.get("price")
         or data.get("priceText")
+        or data.get("current_price")
+        or data.get("sale_price")
     )
 
     image_url = (
@@ -206,7 +291,6 @@ async def scrape_hepsiburada_api(url: str) -> ScrapedProduct:
         or data.get("image")
     )
 
-    # Bazı API cevaplarında images listesi olabilir.
     if not image_url:
         images = data.get("images")
 
@@ -220,6 +304,7 @@ async def scrape_hepsiburada_api(url: str) -> ScrapedProduct:
                 image_url = (
                     first.get("url")
                     or first.get("imageUrl")
+                    or first.get("src")
                 )
 
     brand = (
@@ -231,17 +316,25 @@ async def scrape_hepsiburada_api(url: str) -> ScrapedProduct:
         data.get("sku")
         or data.get("productId")
         or data.get("product_id")
+        or product_code
     )
 
     if not title:
         raise RuntimeError(
-            "Hepsiburada API ürün adını döndürmedi."
+            "Hepsiburada API ürün adını döndürmedi. "
+            f"Veri: {json.dumps(data, ensure_ascii=False)[:2000]}"
         )
 
     if price is None:
         raise RuntimeError(
-            "Hepsiburada API ürün fiyatını döndürmedi."
+            "Hepsiburada API fiyat döndürmedi. "
+            f"Veri: {json.dumps(data, ensure_ascii=False)[:2000]}"
         )
+
+    print(
+        "HEPSIBURADA FINAL PRICE:",
+        price,
+    )
 
     return ScrapedProduct(
         title=title[:500],
@@ -271,14 +364,15 @@ def extract_html_data(html: str):
     brand = None
     model = None
 
-    # JSON-LD
     for script in soup.find_all(
         "script",
         type="application/ld+json",
     ):
         raw = (
             script.string
-            or script.get_text(strip=True)
+            or script.get_text(
+                strip=True
+            )
         )
 
         if not raw:
@@ -286,17 +380,25 @@ def extract_html_data(html: str):
 
         try:
             payload = json.loads(raw)
+
         except Exception:
             continue
 
-        product = walk_for_product(payload)
+        product = walk_for_product(
+            payload
+        )
 
         if not product:
             continue
 
-        title = product.get("name") or title
+        if not title:
+            title = product.get(
+                "name"
+            )
 
-        image = product.get("image")
+        image = product.get(
+            "image"
+        )
 
         if isinstance(image, str):
             image_url = image
@@ -305,12 +407,18 @@ def extract_html_data(html: str):
             image_url = image[0]
 
         elif isinstance(image, dict):
-            image_url = image.get("url")
+            image_url = image.get(
+                "url"
+            )
 
-        brand_data = product.get("brand")
+        brand_data = product.get(
+            "brand"
+        )
 
         if isinstance(brand_data, dict):
-            brand = brand_data.get("name")
+            brand = brand_data.get(
+                "name"
+            )
 
         elif isinstance(brand_data, str):
             brand = brand_data
@@ -321,26 +429,32 @@ def extract_html_data(html: str):
             or product.get("mpn")
         )
 
-        offers = product.get("offers")
+        offers = product.get(
+            "offers"
+        )
 
         if isinstance(offers, dict):
             offers = [offers]
 
         if isinstance(offers, list):
             for offer in offers:
-                if not isinstance(offer, dict):
+                if not isinstance(
+                    offer,
+                    dict,
+                ):
                     continue
 
-                price = clean_price(
+                candidate = clean_price(
                     offer.get("price")
                     or offer.get("lowPrice")
                     or offer.get("salePrice")
+                    or offer.get("sellingPrice")
                 )
 
-                if price:
+                if candidate:
+                    price = candidate
                     break
 
-    # OpenGraph
     if not title:
         node = soup.find(
             "meta",
@@ -348,7 +462,9 @@ def extract_html_data(html: str):
         )
 
         if node:
-            title = node.get("content")
+            title = node.get(
+                "content"
+            )
 
     if not image_url:
         node = soup.find(
@@ -357,25 +473,59 @@ def extract_html_data(html: str):
         )
 
         if node:
-            image_url = node.get("content")
+            image_url = node.get(
+                "content"
+            )
 
-    # Meta price
     if price is None:
         for selector in [
             'meta[property="product:price:amount"]',
             'meta[property="og:price:amount"]',
             'meta[itemprop="price"]',
         ]:
-
-            node = soup.select_one(selector)
+            node = soup.select_one(
+                selector
+            )
 
             if not node:
                 continue
 
-            price = clean_price(
+            candidate = clean_price(
                 node.get("content")
                 or node.get("value")
             )
+
+            if candidate:
+                price = candidate
+                break
+
+    if price is None:
+        amazon_selectors = [
+            ".priceToPay .a-offscreen",
+            "#corePriceDisplay_desktop_feature_div .a-price .a-offscreen",
+            "#corePrice_feature_div .a-price .a-offscreen",
+            ".apexPriceToPay .a-offscreen",
+            ".a-price .a-offscreen",
+            "#priceblock_ourprice",
+            "#priceblock_dealprice",
+        ]
+
+        for selector in amazon_selectors:
+            nodes = soup.select(
+                selector
+            )
+
+            for node in nodes[:20]:
+                candidate = clean_price(
+                    node.get_text(
+                        " ",
+                        strip=True,
+                    )
+                )
+
+                if candidate:
+                    price = candidate
+                    break
 
             if price:
                 break
@@ -405,12 +555,15 @@ async def scrape_http(url: str):
         follow_redirects=True,
         timeout=20,
     ) as client:
-
-        response = await client.get(url)
+        response = await client.get(
+            url
+        )
 
         response.raise_for_status()
 
-        final_url = str(response.url)
+        final_url = str(
+            response.url
+        )
 
         data = extract_html_data(
             response.text
@@ -425,7 +578,6 @@ async def scrape_http(url: str):
 
 async def scrape_browser(url: str):
     async with async_playwright() as p:
-
         browser = await p.chromium.launch(
             headless=True,
             args=[
@@ -437,10 +589,16 @@ async def scrape_browser(url: str):
         context = await browser.new_context(
             locale="tr-TR",
             timezone_id="Europe/Istanbul",
-            user_agent=HEADERS["User-Agent"],
+            user_agent=HEADERS[
+                "User-Agent"
+            ],
             viewport={
                 "width": 1440,
                 "height": 1200,
+            },
+            extra_http_headers={
+                "Accept-Language":
+                "tr-TR,tr;q=0.9,en;q=0.8"
             },
         )
 
@@ -465,7 +623,6 @@ async def scrape_browser(url: str):
                 )
 
             final_url = page.url
-
             store = detect_store(
                 final_url
             )
@@ -476,9 +633,7 @@ async def scrape_browser(url: str):
                 html
             )
 
-            # Amazon
             if store == "Amazon Türkiye":
-
                 selectors = [
                     ".priceToPay .a-offscreen",
                     "#corePriceDisplay_desktop_feature_div .a-price .a-offscreen",
@@ -489,18 +644,14 @@ async def scrape_browser(url: str):
                     "#priceblock_dealprice",
                 ]
 
-            # Trendyol
             elif store == "Trendyol":
-
                 selectors = [
                     ".prc-dsc",
                     ".prc-slg",
                     '[class*="price"]',
                 ]
 
-            # N11
             elif store == "N11":
-
                 selectors = [
                     ".newPrice ins",
                     ".price",
@@ -508,16 +659,13 @@ async def scrape_browser(url: str):
                 ]
 
             else:
-
                 selectors = [
                     '[itemprop="price"]',
                     '[class*="price"]',
                 ]
 
             if data["price"] is None:
-
                 for selector in selectors:
-
                     try:
                         locator = page.locator(
                             selector
@@ -528,7 +676,6 @@ async def scrape_browser(url: str):
                         for i in range(
                             min(count, 20)
                         ):
-
                             text = (
                                 await locator
                                 .nth(i)
@@ -552,12 +699,10 @@ async def scrape_browser(url: str):
                     except Exception:
                         pass
 
-            # Amazon body fallback
             if (
                 store == "Amazon Türkiye"
                 and data["price"] is None
             ):
-
                 try:
                     body = (
                         await page.locator(
@@ -580,7 +725,8 @@ async def scrape_browser(url: str):
                     ]
 
                     parsed = [
-                        x for x in parsed
+                        x
+                        for x in parsed
                         if x is not None
                     ]
 
@@ -607,22 +753,18 @@ async def scrape_browser(url: str):
                 except Exception:
                     pass
 
-            # Title
             if not data["title"]:
-
                 for selector in [
                     "#productTitle",
                     "h1",
                     '[data-test-id="product-name"]',
                 ]:
-
                     try:
                         node = page.locator(
                             selector
                         ).first
 
                         if await node.count():
-
                             text = (
                                 await node
                                 .text_content(
@@ -638,21 +780,17 @@ async def scrape_browser(url: str):
                     except Exception:
                         pass
 
-            # Image
             if not data["image_url"]:
-
                 for selector in [
                     "#landingImage",
                     'img[itemprop="image"]',
                 ]:
-
                     try:
                         node = page.locator(
                             selector
                         ).first
 
                         if await node.count():
-
                             src = await node.get_attribute(
                                 "src"
                             )
@@ -663,6 +801,16 @@ async def scrape_browser(url: str):
 
                     except Exception:
                         pass
+
+            print(
+                "BROWSER STORE:",
+                store,
+            )
+
+            print(
+                "BROWSER FINAL PRICE:",
+                data["price"],
+            )
 
             return final_url, data
 
@@ -686,14 +834,15 @@ async def scrape_product(
             "Geçerli bir ürün linki gir."
         )
 
-    store = detect_store(url)
+    store = detect_store(
+        url
+    )
 
     # =====================================================
-    # HEPSIBURADA ARTIK DIREKT API
+    # HEPSIBURADA
     # =====================================================
 
     if store == "Hepsiburada":
-
         print(
             "HEPSIBURADA -> PARSE API"
         )
@@ -703,7 +852,7 @@ async def scrape_product(
         )
 
     # =====================================================
-    # DIGER MAGAZALAR HTTP
+    # DIGER MAGAZALAR - HTTP
     # =====================================================
 
     http_error = None
@@ -717,19 +866,39 @@ async def scrape_product(
             data["price"] is not None
             and data["title"]
         ):
+            print(
+                "HTTP SUCCESS:",
+                detect_store(final_url),
+                data["price"],
+            )
 
             return ScrapedProduct(
-                title=data["title"][:500],
+                title=data[
+                    "title"
+                ][:500],
+
                 store=detect_store(
                     final_url
                 ),
+
                 url=final_url,
-                price=data["price"],
+
+                price=data[
+                    "price"
+                ],
+
                 image_url=data[
                     "image_url"
                 ],
-                brand=data["brand"],
-                model=data["model"],
+
+                brand=data[
+                    "brand"
+                ],
+
+                model=data[
+                    "model"
+                ],
+
                 method="http",
             )
 
@@ -742,7 +911,7 @@ async def scrape_product(
         )
 
     # =====================================================
-    # DIGER MAGAZALAR CHROMIUM
+    # DIGER MAGAZALAR - CHROMIUM
     # =====================================================
 
     try:
@@ -759,21 +928,40 @@ async def scrape_product(
             )
 
         return ScrapedProduct(
-            title=data["title"][:500],
+            title=data[
+                "title"
+            ][:500],
+
             store=detect_store(
                 final_url
             ),
+
             url=final_url,
-            price=data["price"],
+
+            price=data[
+                "price"
+            ],
+
             image_url=data[
                 "image_url"
             ],
-            brand=data["brand"],
-            model=data["model"],
+
+            brand=data[
+                "brand"
+            ],
+
+            model=data[
+                "model"
+            ],
+
             method="browser",
         )
 
     except Exception as browser_error:
+        print(
+            "BROWSER ERROR:",
+            repr(browser_error),
+        )
 
         if http_error:
             raise RuntimeError(
