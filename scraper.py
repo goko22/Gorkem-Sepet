@@ -2,6 +2,7 @@ import json
 import os
 import re
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from typing import Optional
 
 import httpx
@@ -94,6 +95,27 @@ def clean_price(value):
     return parse_price(text)
 
 
+def normalize_text(text):
+    text = str(text or "").lower()
+    text = re.sub(r"[^a-z0-9çğıöşü\s]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def similarity(a, b):
+    a = normalize_text(a)
+    b = normalize_text(b)
+
+    if not a or not b:
+        return 0.0
+
+    return SequenceMatcher(
+        None,
+        a,
+        b,
+    ).ratio()
+
+
 def walk_for_product(data):
     if isinstance(data, dict):
         product_type = data.get("@type")
@@ -152,10 +174,9 @@ async def scrape_hepsiburada_api(url: str) -> ScrapedProduct:
             "Hepsiburada ürün kodu URL içinden bulunamadı."
         )
 
-    endpoint = (
+    base_url = (
         "https://api.parse.bot/scraper/"
-        "a42a78b8-347f-4c69-8e83-135320d2b001/"
-        "get_product_details"
+        "a42a78b8-347f-4c69-8e83-135320d2b001"
     )
 
     headers = {
@@ -163,24 +184,29 @@ async def scrape_hepsiburada_api(url: str) -> ScrapedProduct:
         "Accept": "application/json",
     }
 
+    # =====================================================
+    # 1 - PRODUCT DETAILS
+    # =====================================================
+
+    details_endpoint = (
+        f"{base_url}/get_product_details"
+    )
+
+    details_payload = None
+    last_status = None
+    last_body = None
+
     param_candidates = [
+        {
+            "url": url
+        },
         {
             "product_id": product_code
         },
         {
             "sku": product_code
         },
-        {
-            "url": url
-        },
-        {
-            "product_url": url
-        },
     ]
-
-    payload = None
-    last_status = None
-    last_body = None
 
     async with httpx.AsyncClient(
         timeout=45,
@@ -189,12 +215,12 @@ async def scrape_hepsiburada_api(url: str) -> ScrapedProduct:
 
         for params in param_candidates:
             print(
-                "HEPSIBURADA PARSE TRY:",
+                "HEPSIBURADA DETAILS TRY:",
                 params,
             )
 
             response = await client.get(
-                endpoint,
+                details_endpoint,
                 headers=headers,
                 params=params,
             )
@@ -203,149 +229,286 @@ async def scrape_hepsiburada_api(url: str) -> ScrapedProduct:
             last_body = response.text[:3000]
 
             print(
-                "HEPSIBURADA PARSE STATUS:",
+                "HEPSIBURADA DETAILS STATUS:",
                 response.status_code,
             )
 
-            print(
-                "HEPSIBURADA PARSE BODY:",
-                last_body,
-            )
-
             if response.status_code == 200:
-                try:
-                    payload = response.json()
-                    break
-                except Exception as e:
-                    raise RuntimeError(
-                        f"Parse API JSON cevabı okunamadı: {e}"
-                    )
+                details_payload = response.json()
+                break
 
             if response.status_code == 422:
                 continue
 
             if response.status_code == 429:
                 raise RuntimeError(
-                    "Parse API rate limit doldu. Birkaç dakika sonra tekrar dene."
-                )
-
-            if response.status_code == 401:
-                raise RuntimeError(
-                    "PARSE_API_KEY geçersiz veya yetkisiz."
-                )
-
-            if response.status_code == 403:
-                raise RuntimeError(
-                    "Parse API erişimi reddetti. API key/plan kontrol edilmeli."
+                    "Parse API rate limit doldu."
                 )
 
             response.raise_for_status()
 
-    if payload is None:
-        raise RuntimeError(
-            "Hepsiburada API hiçbir parametreyi kabul etmedi. "
-            f"Son durum: {last_status}. "
-            f"Cevap: {last_body}"
-        )
-
-    print(
-        "HEPSIBURADA PARSE SUCCESS:",
-        json.dumps(
-            payload,
-            ensure_ascii=False,
-        )[:5000],
-    )
-
-    data = payload.get("data", payload)
-
-    if isinstance(data, list):
-        if not data:
+        if details_payload is None:
             raise RuntimeError(
-                "Hepsiburada API boş sonuç döndürdü."
+                "Hepsiburada detay API başarısız. "
+                f"Son durum: {last_status}. "
+                f"Cevap: {last_body}"
             )
 
-        data = data[0]
-
-    if not isinstance(data, dict):
-        raise RuntimeError(
-            "Hepsiburada API beklenmeyen veri tipi döndürdü."
+        details_data = details_payload.get(
+            "data",
+            details_payload,
         )
 
-    title = (
-        data.get("product_name")
-        or data.get("name")
-        or data.get("title")
-    )
-
-    price = clean_price(
-        data.get("unit_price")
-        or data.get("price")
-        or data.get("priceText")
-        or data.get("current_price")
-        or data.get("sale_price")
-    )
-
-    image_url = (
-        data.get("imageUrl")
-        or data.get("image_url")
-        or data.get("image")
-    )
-
-    if not image_url:
-        images = data.get("images")
-
-        if isinstance(images, list) and images:
-            first = images[0]
-
-            if isinstance(first, str):
-                image_url = first
-
-            elif isinstance(first, dict):
-                image_url = (
-                    first.get("url")
-                    or first.get("imageUrl")
-                    or first.get("src")
+        if isinstance(details_data, list):
+            if not details_data:
+                raise RuntimeError(
+                    "Hepsiburada detay API boş sonuç döndürdü."
                 )
 
-    brand = (
-        data.get("brand")
-        or data.get("brand_name")
-    )
+            details_data = details_data[0]
 
-    model = (
-        data.get("sku")
-        or data.get("productId")
-        or data.get("product_id")
-        or product_code
-    )
+        if not isinstance(details_data, dict):
+            raise RuntimeError(
+                "Hepsiburada detay API beklenmeyen veri döndürdü."
+            )
 
-    if not title:
-        raise RuntimeError(
-            "Hepsiburada API ürün adını döndürmedi. "
-            f"Veri: {json.dumps(data, ensure_ascii=False)[:2000]}"
+        title = (
+            details_data.get("product_name")
+            or details_data.get("name")
+            or details_data.get("title")
         )
 
-    if price is None:
-        raise RuntimeError(
-            "Hepsiburada API fiyat döndürmedi. "
-            f"Veri: {json.dumps(data, ensure_ascii=False)[:2000]}"
+        price = clean_price(
+            details_data.get("unit_price")
+            or details_data.get("price")
+            or details_data.get("priceText")
+            or details_data.get("current_price")
+            or details_data.get("sale_price")
         )
 
-    print(
-        "HEPSIBURADA FINAL PRICE:",
-        price,
-    )
+        brand = (
+            details_data.get("brand")
+            or details_data.get("brand_name")
+        )
 
-    return ScrapedProduct(
-        title=title[:500],
-        store="Hepsiburada",
-        url=url,
-        price=price,
-        image_url=image_url,
-        brand=brand,
-        model=model,
-        method="parse-api",
-    )
+        model = (
+            details_data.get("sku")
+            or details_data.get("productId")
+            or details_data.get("product_id")
+            or product_code
+        )
+
+        if not title:
+            raise RuntimeError(
+                "Hepsiburada API ürün adını döndürmedi."
+            )
+
+        if price is None:
+            raise RuntimeError(
+                "Hepsiburada API fiyat döndürmedi."
+            )
+
+        print(
+            "HEPSIBURADA DETAILS PRICE:",
+            price,
+        )
+
+        # =================================================
+        # 2 - SEARCH PRODUCTS ILE RESIM
+        # =================================================
+
+        search_endpoint = (
+            f"{base_url}/search_products"
+        )
+
+        search_params = {
+            "page": 1,
+            "query": title,
+        }
+
+        print(
+            "HEPSIBURADA SEARCH QUERY:",
+            title,
+        )
+
+        search_response = await client.get(
+            search_endpoint,
+            headers=headers,
+            params=search_params,
+        )
+
+        print(
+            "HEPSIBURADA SEARCH STATUS:",
+            search_response.status_code,
+        )
+
+        image_url = None
+
+        if search_response.status_code == 200:
+            try:
+                search_payload = search_response.json()
+
+                search_data = search_payload.get(
+                    "data",
+                    search_payload,
+                )
+
+                products = []
+
+                if isinstance(search_data, dict):
+                    products = search_data.get(
+                        "products",
+                        [],
+                    )
+
+                if not isinstance(products, list):
+                    products = []
+
+                best_match = None
+                best_score = -1
+
+                for item in products:
+                    if not isinstance(item, dict):
+                        continue
+
+                    item_sku = str(
+                        item.get("sku")
+                        or ""
+                    ).upper()
+
+                    item_product_id = str(
+                        item.get("productId")
+                        or item.get("product_id")
+                        or ""
+                    ).upper()
+
+                    item_name = (
+                        item.get("name")
+                        or item.get("product_name")
+                        or ""
+                    )
+
+                    score = 0.0
+
+                    # SKU birebir eşleşirse en güvenilir.
+                    if (
+                        item_sku
+                        and item_sku == product_code
+                    ):
+                        score += 100
+
+                    # Details API HBC product_id döndürdüyse onu da eşleştir.
+                    details_product_id = str(
+                        details_data.get("product_id")
+                        or details_data.get("productId")
+                        or ""
+                    ).upper()
+
+                    if (
+                        details_product_id
+                        and item_product_id == details_product_id
+                    ):
+                        score += 100
+
+                    # İsim benzerliği.
+                    score += (
+                        similarity(
+                            title,
+                            item_name,
+                        )
+                        * 50
+                    )
+
+                    # Marka eşleşmesi.
+                    item_brand = normalize_text(
+                        item.get("brand")
+                    )
+
+                    detail_brand = normalize_text(
+                        brand
+                    )
+
+                    if (
+                        item_brand
+                        and detail_brand
+                        and item_brand == detail_brand
+                    ):
+                        score += 20
+
+                    # Fiyat yakınlığı.
+                    item_price = clean_price(
+                        item.get("price")
+                        or item.get("priceText")
+                    )
+
+                    if (
+                        item_price is not None
+                        and price is not None
+                    ):
+                        difference = abs(
+                            item_price - price
+                        )
+
+                        if difference < 0.01:
+                            score += 30
+
+                        elif difference <= max(
+                            5,
+                            price * 0.05,
+                        ):
+                            score += 15
+
+                    if score > best_score:
+                        best_score = score
+                        best_match = item
+
+                print(
+                    "HEPSIBURADA IMAGE MATCH SCORE:",
+                    best_score,
+                )
+
+                if best_match:
+                    print(
+                        "HEPSIBURADA IMAGE MATCH:",
+                        json.dumps(
+                            best_match,
+                            ensure_ascii=False,
+                        )[:2000],
+                    )
+
+                    image_url = (
+                        best_match.get("imageUrl")
+                        or best_match.get("image_url")
+                        or best_match.get("image")
+                    )
+
+            except Exception as e:
+                print(
+                    "HEPSIBURADA SEARCH PARSE ERROR:",
+                    repr(e),
+                )
+
+        else:
+            print(
+                "HEPSIBURADA SEARCH BODY:",
+                search_response.text[:2000],
+            )
+
+        print(
+            "HEPSIBURADA FINAL IMAGE:",
+            image_url,
+        )
+
+        return ScrapedProduct(
+            title=title[:500],
+            store="Hepsiburada",
+            url=url,
+            price=price,
+            image_url=image_url,
+            brand=brand,
+            model=model,
+            method="parse-api",
+        )
 
 
 # =========================================================
@@ -844,7 +1007,7 @@ async def scrape_product(
 
     if store == "Hepsiburada":
         print(
-            "HEPSIBURADA -> PARSE API"
+            "HEPSIBURADA -> PARSE API + IMAGE SEARCH"
         )
 
         return await scrape_hepsiburada_api(
