@@ -14,7 +14,6 @@ from urllib.parse import (
 )
 
 import httpx
-
 from bs4 import BeautifulSoup
 
 from playwright.async_api import (
@@ -41,10 +40,7 @@ HEADERS = {
         "Chrome/124.0.0.0 "
         "Safari/537.36"
     ),
-
-    "Accept-Language":
-        "tr-TR,tr;q=0.9,en;q=0.8",
-
+    "Accept-Language": "tr-TR,tr;q=0.9,en;q=0.8",
     "Accept": (
         "text/html,"
         "application/xhtml+xml,"
@@ -61,10 +57,7 @@ HTTP_TIMEOUT = httpx.Timeout(
     pool=4.0,
 )
 
-
-BROWSER_GOTO_TIMEOUT = (
-    25000
-)
+BROWSER_GOTO_TIMEOUT = 25000
 
 
 # =========================================================
@@ -80,9 +73,7 @@ def get_browser_lock():
     global _browser_lock
 
     if _browser_lock is None:
-        _browser_lock = (
-            asyncio.Lock()
-        )
+        _browser_lock = asyncio.Lock()
 
     return _browser_lock
 
@@ -92,11 +83,8 @@ async def get_browser():
     global _browser_instance
 
     if (
-        _browser_instance
-        is not None
-        and
-        _browser_instance
-        .is_connected()
+        _browser_instance is not None
+        and _browser_instance.is_connected()
     ):
         return _browser_instance
 
@@ -105,59 +93,36 @@ async def get_browser():
     async with lock:
 
         if (
-            _browser_instance
-            is not None
-            and
-            _browser_instance
-            .is_connected()
+            _browser_instance is not None
+            and _browser_instance.is_connected()
         ):
             return _browser_instance
 
-        print(
-            "BROWSER STARTING..."
-        )
+        print("BROWSER STARTING...")
 
-        if (
-            _playwright_instance
-            is None
-        ):
+        if _playwright_instance is None:
             _playwright_instance = (
-                await async_playwright()
-                .start()
+                await async_playwright().start()
             )
 
         _browser_instance = (
-            await
-            _playwright_instance
-            .chromium
-            .launch(
+            await _playwright_instance.chromium.launch(
                 headless=True,
-
                 args=[
                     "--no-sandbox",
-
                     "--disable-dev-shm-usage",
-
                     "--disable-gpu",
-
                     "--disable-background-networking",
-
                     "--disable-background-timer-throttling",
-
                     "--disable-renderer-backgrounding",
-
                     "--disable-component-update",
-
                     "--disable-default-apps",
-
                     "--no-first-run",
                 ],
             )
         )
 
-        print(
-            "BROWSER READY"
-        )
+        print("BROWSER READY")
 
         return _browser_instance
 
@@ -165,16 +130,9 @@ async def get_browser():
 async def reset_browser():
     global _browser_instance
 
-    if (
-        _browser_instance
-        is not None
-    ):
+    if _browser_instance is not None:
         try:
-            await (
-                _browser_instance
-                .close()
-            )
-
+            await _browser_instance.close()
         except Exception:
             pass
 
@@ -191,41 +149,23 @@ class ScrapedProduct:
     store: str
     url: str
 
-    price: Optional[
-        float
-    ] = None
+    price: Optional[float] = None
+    image_url: Optional[str] = None
+    brand: Optional[str] = None
+    model: Optional[str] = None
 
-    image_url: Optional[
-        str
-    ] = None
-
-    brand: Optional[
-        str
-    ] = None
-
-    model: Optional[
-        str
-    ] = None
-
-    variants: Optional[
-        dict
-    ] = None
-
-    variant_text: Optional[
-        str
-    ] = None
+    variants: Optional[dict] = None
+    variant_text: Optional[str] = None
 
     method: str = "unknown"
 
 
 # =========================================================
-# TEXT NORMALIZATION
+# GENEL YARDIMCILAR
 # =========================================================
 
 def normalize_text(text):
-    text = str(
-        text or ""
-    ).lower()
+    text = str(text or "").lower()
 
     replacements = {
         "ı": "i",
@@ -236,13 +176,8 @@ def normalize_text(text):
         "ç": "c",
     }
 
-    for old, new in (
-        replacements.items()
-    ):
-        text = text.replace(
-            old,
-            new,
-        )
+    for old, new in replacements.items():
+        text = text.replace(old, new)
 
     text = re.sub(
         r"[^a-z0-9\s]",
@@ -259,10 +194,7 @@ def normalize_text(text):
     return text.strip()
 
 
-def similarity(
-    a,
-    b,
-):
+def similarity(a, b):
     a = normalize_text(a)
     b = normalize_text(b)
 
@@ -276,30 +208,147 @@ def similarity(
     ).ratio()
 
 
+def normalize_image_url(url):
+    if not url:
+        return None
+
+    url = str(url).strip()
+
+    if url.startswith("//"):
+        return "https:" + url
+
+    return url
+
+
 # =========================================================
-# VARIANT HELPERS
+# FIYAT
+# =========================================================
+
+def clean_price(value):
+    """
+    4.799 TL       -> 4799
+    12.499 TL      -> 12499
+    4.799,90 TL    -> 4799.90
+    899,99 TL      -> 899.99
+
+    API:
+    229.00         -> 229
+    898.99         -> 898.99
+    """
+
+    if value is None:
+        return None
+
+    if isinstance(
+        value,
+        (int, float),
+    ):
+        number = float(value)
+
+        if 0 < number < 100_000_000:
+            return number
+
+        return None
+
+    text = str(value).strip()
+
+    if not text:
+        return None
+
+    match = re.search(
+        r"\d[\d.,]*",
+        text,
+    )
+
+    if not match:
+        try:
+            return parse_price(text)
+        except Exception:
+            return None
+
+    raw = match.group(0)
+
+    try:
+
+        # 4.799,90
+        if "." in raw and "," in raw:
+
+            if raw.rfind(",") > raw.rfind("."):
+                raw = (
+                    raw
+                    .replace(".", "")
+                    .replace(",", ".")
+                )
+
+            else:
+                raw = raw.replace(",", "")
+
+        # 899,99
+        elif "," in raw:
+            parts = raw.split(",")
+
+            if (
+                len(parts) == 2
+                and len(parts[-1]) in (1, 2)
+            ):
+                raw = raw.replace(",", ".")
+
+            else:
+                raw = raw.replace(",", "")
+
+        # 4.799
+        elif "." in raw:
+            parts = raw.split(".")
+
+            if (
+                len(parts) >= 2
+                and all(
+                    len(part) == 3
+                    for part in parts[1:]
+                )
+            ):
+                raw = raw.replace(".", "")
+
+        number = float(raw)
+
+        if 0 < number < 100_000_000:
+            return number
+
+    except Exception:
+        pass
+
+    try:
+        return parse_price(text)
+    except Exception:
+        return None
+
+
+# =========================================================
+# VARIANT
 # =========================================================
 
 def pretty_variant_value(
     key,
     value,
 ):
+    if value is None:
+        return None
+
     value = unquote(
-        str(value or "")
+        str(value)
     ).strip()
 
     if not value:
         return None
 
-    normalized = (
-        normalize_text(value)
+    normalized = normalize_text(
+        value
     )
 
-    # Boyut / yüzey isimleri.
     uppercase_values = {
         "soft",
         "xsoft",
-        "x-soft",
+        "x soft",
         "mid",
         "xl",
         "xxl",
@@ -310,35 +359,183 @@ def pretty_variant_value(
     }
 
     if normalized in uppercase_values:
+        if normalized == "x soft":
+            return "XSOFT"
+
         return value.upper()
 
-    # Renk.
-    if normalized == "siyah":
-        return "Siyah"
+    color_names = {
+        "siyah": "Siyah",
+        "black": "Black",
+        "beyaz": "Beyaz",
+        "white": "White",
+        "turuncu": "Turuncu",
+        "orange": "Orange",
+        "kirmizi": "Kırmızı",
+        "red": "Red",
+        "mavi": "Mavi",
+        "blue": "Blue",
+        "yesil": "Yeşil",
+        "green": "Green",
+        "pembe": "Pembe",
+        "pink": "Pink",
+        "mor": "Mor",
+        "purple": "Purple",
+        "gri": "Gri",
+        "gray": "Gray",
+        "grey": "Grey",
+    }
 
-    if normalized == "beyaz":
-        return "Beyaz"
+    if normalized in color_names:
+        return color_names[
+            normalized
+        ]
 
-    if normalized == "turuncu":
-        return "Turuncu"
-
-    # Ölçü formatını bozma.
+    # 500 x 500 mm
+    # 2.5m
+    # 5m
     if re.search(
-        r"\d+\s*[xX×]\s*\d+",
+        r"\d",
         value,
     ):
         return value
 
-    # Shopify zaten düzgün isim döndürüyorsa koru.
-    if (
-        any(
-            char.isupper()
-            for char in value
-        )
+    if any(
+        char.isupper()
+        for char in value
     ):
         return value
 
     return value.capitalize()
+
+
+def infer_variant_label(
+    label,
+    value,
+    index=0,
+):
+    """
+    Shopify mağazaları option isimlerini
+    farklı farklı yazabiliyor.
+
+    Size / Boyut / Ölçü / Seçenekler vs.
+    """
+
+    original = str(
+        label or ""
+    ).strip()
+
+    normalized = normalize_text(
+        original
+    )
+
+    mapping = {
+        "surface": "Yüzey",
+        "yuzey": "Yüzey",
+
+        "size": "Boyut",
+        "boyut": "Boyut",
+
+        "dimension": "Ölçü",
+        "dimensions": "Ölçü",
+        "olcu": "Ölçü",
+        "uzunluk": "Uzunluk",
+        "length": "Uzunluk",
+
+        "color": "Renk",
+        "colour": "Renk",
+        "renk": "Renk",
+
+        "beden": "Beden",
+
+        "switch": "Switch",
+
+        "dongle": "Dongle",
+
+        "layout": "Layout",
+
+        "capacity": "Kapasite",
+        "kapasite": "Kapasite",
+
+        "hafiza": "Hafıza",
+        "memory": "Hafıza",
+
+        "model": "Model",
+
+        "style": "Stil",
+        "stil": "Stil",
+    }
+
+    if normalized in mapping:
+        return mapping[
+            normalized
+        ]
+
+    value_text = str(
+        value or ""
+    ).strip()
+
+    value_norm = normalize_text(
+        value_text
+    )
+
+    # Generic Shopify option isimleri.
+    generic_names = {
+        "",
+        "option",
+        "options",
+        "secenek",
+        "secenekler",
+        "variant",
+        "varyant",
+        "title",
+        "default",
+    }
+
+    if normalized in generic_names:
+
+        # 500 x 500 mm gibi.
+        if re.search(
+            r"\d+\s*[xX×]\s*\d+",
+            value_text,
+        ):
+            return "Boyut"
+
+        # 5m / 2,5m / 100 cm gibi.
+        if re.fullmatch(
+            r"\s*\d+(?:[.,]\d+)?\s*"
+            r"(?:mm|cm|m|metre|meter)\s*",
+            value_text,
+            re.I,
+        ):
+            return "Ölçü"
+
+        # Bilinen yüzey değerleri.
+        if value_norm in {
+            "soft",
+            "xsoft",
+            "x soft",
+            "mid",
+            "speed",
+            "control",
+            "surge",
+        }:
+            return "Yüzey"
+
+        return (
+            "Seçenek"
+            if index == 0
+            else f"Seçenek {index + 1}"
+        )
+
+    if original:
+        return original
+
+    return (
+        "Seçenek"
+        if index == 0
+        else f"Seçenek {index + 1}"
+    )
 
 
 def make_variant_text(
@@ -349,9 +546,8 @@ def make_variant_text(
 
     parts = []
 
-    for key, value in (
-        variants.items()
-    ):
+    for key, value in variants.items():
+
         if value is None:
             continue
 
@@ -369,21 +565,16 @@ def make_variant_text(
     if not parts:
         return None
 
-    return " • ".join(
-        parts
-    )
+    return " • ".join(parts)
 
 
 def query_variants(
     url,
 ):
-    """
-    Diğer mağazalarda URL içinde
-    bariz varyant bilgisi varsa yakala.
-    """
-
     query = parse_qs(
-        urlparse(url).query
+        urlparse(
+            url
+        ).query
     )
 
     mapping = {
@@ -392,6 +583,9 @@ def query_variants(
 
         "boyut": "Boyut",
         "size": "Boyut",
+
+        "olcu": "Ölçü",
+        "dimension": "Ölçü",
 
         "beden": "Beden",
 
@@ -406,7 +600,6 @@ def query_variants(
         "layout": "Layout",
 
         "kapasite": "Kapasite",
-
         "capacity": "Kapasite",
     }
 
@@ -430,180 +623,20 @@ def query_variants(
             continue
 
         value = pretty_variant_value(
-            key,
+            label,
             values[0],
         )
 
         if value:
-            result[label] = (
-                value
-            )
+            result[
+                label
+            ] = value
 
     return result
 
 
 # =========================================================
-# FIYAT
-# =========================================================
-
-def clean_price(value):
-    """
-    4.799 TL       -> 4799
-    12.499 TL      -> 12499
-    4.799,90 TL    -> 4799.90
-    899,99 TL      -> 899.99
-
-    API:
-    229.00 -> 229
-    """
-
-    if value is None:
-        return None
-
-    if isinstance(
-        value,
-        (int, float),
-    ):
-        number = float(
-            value
-        )
-
-        if (
-            0
-            < number
-            < 100_000_000
-        ):
-            return number
-
-        return None
-
-    text = str(
-        value
-    ).strip()
-
-    if not text:
-        return None
-
-    match = re.search(
-        r"\d[\d.,]*",
-        text,
-    )
-
-    if not match:
-        try:
-            return parse_price(
-                text
-            )
-
-        except Exception:
-            return None
-
-    raw = match.group(0)
-
-    try:
-
-        if (
-            "." in raw
-            and
-            "," in raw
-        ):
-            if (
-                raw.rfind(",")
-                >
-                raw.rfind(".")
-            ):
-                raw = (
-                    raw
-                    .replace(
-                        ".",
-                        "",
-                    )
-                    .replace(
-                        ",",
-                        ".",
-                    )
-                )
-
-            else:
-                raw = (
-                    raw.replace(
-                        ",",
-                        "",
-                    )
-                )
-
-        elif "," in raw:
-            parts = raw.split(
-                ","
-            )
-
-            if (
-                len(parts) == 2
-                and
-                len(parts[-1])
-                in (1, 2)
-            ):
-                raw = (
-                    raw.replace(
-                        ",",
-                        ".",
-                    )
-                )
-
-            else:
-                raw = (
-                    raw.replace(
-                        ",",
-                        "",
-                    )
-                )
-
-        elif "." in raw:
-            parts = raw.split(
-                "."
-            )
-
-            if (
-                len(parts) >= 2
-                and
-                all(
-                    len(part) == 3
-                    for part
-                    in parts[1:]
-                )
-            ):
-                raw = (
-                    raw.replace(
-                        ".",
-                        "",
-                    )
-                )
-
-        number = float(
-            raw
-        )
-
-        if (
-            0
-            < number
-            < 100_000_000
-        ):
-            return number
-
-    except Exception:
-        pass
-
-    try:
-        return parse_price(
-            text
-        )
-
-    except Exception:
-        return None
-
-
-# =========================================================
-# JSON LD
+# JSON-LD
 # =========================================================
 
 def walk_for_product(data):
@@ -615,10 +648,7 @@ def walk_for_product(data):
             data.get("@type")
         )
 
-        if (
-            product_type
-            == "Product"
-        ):
+        if product_type == "Product":
             return data
 
         if (
@@ -626,19 +656,14 @@ def walk_for_product(data):
                 product_type,
                 list,
             )
-            and
-            "Product"
-            in product_type
+            and "Product" in product_type
         ):
             return data
 
-        for value in (
-            data.values()
-        ):
-            result = (
-                walk_for_product(
-                    value
-                )
+        for value in data.values():
+
+            result = walk_for_product(
+                value
             )
 
             if result:
@@ -649,10 +674,9 @@ def walk_for_product(data):
         list,
     ):
         for item in data:
-            result = (
-                walk_for_product(
-                    item
-                )
+
+            result = walk_for_product(
+                item
             )
 
             if result:
@@ -676,7 +700,8 @@ def extract_hepsiburada_code(
 
     if match:
         return (
-            match.group(1)
+            match
+            .group(1)
             .upper()
         )
 
@@ -714,31 +739,21 @@ async def scrape_hepsiburada_api(
     )
 
     headers = {
-        "X-API-Key":
-            api_key,
-
-        "Accept":
-            "application/json",
+        "X-API-Key": api_key,
+        "Accept": "application/json",
     }
 
-    async with (
-        httpx.AsyncClient(
-            timeout=15,
-            follow_redirects=True,
-        )
+    async with httpx.AsyncClient(
+        timeout=15,
+        follow_redirects=True,
     ) as client:
 
-        response = (
-            await client.get(
-                f"{base_url}"
-                "/get_product_details",
-
-                headers=headers,
-
-                params={
-                    "url": url
-                },
-            )
+        response = await client.get(
+            f"{base_url}/get_product_details",
+            headers=headers,
+            params={
+                "url": url
+            },
         )
 
         print(
@@ -775,51 +790,27 @@ async def scrape_hepsiburada_api(
             )
 
         title = (
-            data.get(
-                "product_name"
-            )
-            or data.get(
-                "name"
-            )
-            or data.get(
-                "title"
-            )
+            data.get("product_name")
+            or data.get("name")
+            or data.get("title")
         )
 
         price = clean_price(
-            data.get(
-                "unit_price"
-            )
-            or data.get(
-                "price"
-            )
-            or data.get(
-                "current_price"
-            )
-            or data.get(
-                "sale_price"
-            )
+            data.get("unit_price")
+            or data.get("price")
+            or data.get("current_price")
+            or data.get("sale_price")
         )
 
         brand = (
-            data.get(
-                "brand"
-            )
-            or data.get(
-                "brand_name"
-            )
+            data.get("brand")
+            or data.get("brand_name")
         )
 
         model = (
-            data.get(
-                "sku"
-            )
-            or data.get(
-                "productId"
-            )
-            or data.get(
-                "product_id"
-            )
+            data.get("sku")
+            or data.get("productId")
+            or data.get("product_id")
             or product_code
         )
 
@@ -834,28 +825,22 @@ async def scrape_hepsiburada_api(
             )
 
         image_url = (
-            data.get(
-                "imageUrl"
-            )
-            or data.get(
-                "image_url"
-            )
-            or data.get(
-                "image"
-            )
+            data.get("imageUrl")
+            or data.get("image_url")
+            or data.get("image")
         )
 
-        # Details endpoint
-        # resim döndürmezse search.
+        # =================================================
+        # RESIM FALLBACK
+        # =================================================
+
         if not image_url:
+
             try:
                 search_response = (
                     await client.get(
-                        f"{base_url}"
-                        "/search_products",
-
+                        f"{base_url}/search_products",
                         headers=headers,
-
                         params={
                             "page": 1,
                             "query": title,
@@ -863,19 +848,21 @@ async def scrape_hepsiburada_api(
                     )
                 )
 
+                print(
+                    "HEPSIBURADA SEARCH STATUS:",
+                    search_response.status_code,
+                )
+
                 if (
-                    search_response
-                    .status_code
+                    search_response.status_code
                     == 200
                 ):
                     search_payload = (
-                        search_response
-                        .json()
+                        search_response.json()
                     )
 
                     search_data = (
-                        search_payload
-                        .get(
+                        search_payload.get(
                             "data",
                             search_payload,
                         )
@@ -888,15 +875,26 @@ async def scrape_hepsiburada_api(
                         dict,
                     ):
                         products = (
-                            search_data
-                            .get(
+                            search_data.get(
                                 "products",
                                 [],
                             )
                         )
 
+                    if not isinstance(
+                        products,
+                        list,
+                    ):
+                        products = []
+
                     best_item = None
                     best_score = -1
+
+                    details_product_id = str(
+                        data.get("product_id")
+                        or data.get("productId")
+                        or ""
+                    ).upper()
 
                     for item in products:
 
@@ -907,9 +905,7 @@ async def scrape_hepsiburada_api(
                             continue
 
                         item_name = (
-                            item.get(
-                                "name"
-                            )
+                            item.get("name")
                             or item.get(
                                 "product_name"
                             )
@@ -924,37 +920,49 @@ async def scrape_hepsiburada_api(
                             * 50
                         )
 
-                        item_price = (
-                            clean_price(
-                                item.get(
-                                    "price"
-                                )
+                        item_sku = str(
+                            item.get("sku")
+                            or ""
+                        ).upper()
+
+                        item_product_id = str(
+                            item.get("productId")
+                            or item.get(
+                                "product_id"
                             )
+                            or ""
+                        ).upper()
+
+                        if (
+                            item_sku
+                            == product_code
+                        ):
+                            score += 100
+
+                        if (
+                            details_product_id
+                            and item_product_id
+                            == details_product_id
+                        ):
+                            score += 100
+
+                        item_price = clean_price(
+                            item.get("price")
                         )
 
                         if (
-                            item_price
-                            is not None
+                            item_price is not None
                             and
                             abs(
                                 item_price
                                 - price
-                            )
-                            < 0.01
+                            ) < 0.01
                         ):
                             score += 30
 
-                        if (
-                            score
-                            > best_score
-                        ):
-                            best_score = (
-                                score
-                            )
-
-                            best_item = (
-                                item
-                            )
+                        if score > best_score:
+                            best_score = score
+                            best_item = item
 
                     if best_item:
                         image_url = (
@@ -979,64 +987,106 @@ async def scrape_hepsiburada_api(
             url
         )
 
-        variant_text = (
-            make_variant_text(
-                variants
-            )
-        )
-
         return ScrapedProduct(
             title=title[:500],
-
             store="Hepsiburada",
-
             url=url,
-
             price=price,
-
-            image_url=image_url,
-
+            image_url=normalize_image_url(
+                image_url
+            ),
             brand=brand,
-
             model=model,
-
             variants=variants,
-
-            variant_text=variant_text,
-
+            variant_text=make_variant_text(
+                variants
+            ),
             method="parse-api",
         )
 
 
 # =========================================================
-# WRAITH / SHOPIFY
+# SHOPIFY - GENEL SISTEM
 # =========================================================
 
-def is_wraith(
-    store,
-    url="",
+def looks_like_shopify_product_url(
+    url,
 ):
-    text = normalize_text(
-        f"{store} {url}"
+    """
+    Shopify product URL'leri genel olarak:
+    /products/urun-slug
+    """
+
+    try:
+        parsed = urlparse(
+            url
+        )
+
+        return (
+            "/products/"
+            in parsed.path.lower()
+        )
+
+    except Exception:
+        return False
+
+
+def shopify_product_json_url(
+    url,
+):
+    parsed = urlparse(
+        url
     )
 
+    clean_path = (
+        parsed.path
+        .rstrip("/")
+    )
+
+    if clean_path.endswith(
+        ".js"
+    ):
+        path = clean_path
+
+    else:
+        path = (
+            clean_path
+            + ".js"
+        )
+
     return (
-        "wraith" in text
+        f"{parsed.scheme}"
+        f"://{parsed.netloc}"
+        f"{path}"
     )
 
 
 def shopify_price(
     value,
 ):
+    """
+    Shopify product.js fiyatı
+    genelde kuruş olarak integer gelir.
+
+    249900 -> 2499 TL
+    """
+
     if value is None:
         return None
 
-    # product.js genelde kuruş/cents
-    # şeklinde integer döndürür.
+    if isinstance(
+        value,
+        bool,
+    ):
+        return None
+
     if isinstance(
         value,
         int,
     ):
+        if value <= 0:
+            return None
+
         return (
             float(value)
             / 100
@@ -1046,23 +1096,37 @@ def shopify_price(
         value,
         float,
     ):
-        return (
-            value / 100
-            if value > 10000
-            else value
-        )
+        if value <= 0:
+            return None
+
+        # JSON'da 249900.0 gibi geldiyse.
+        if value >= 10000:
+            return (
+                value / 100
+            )
+
+        return value
 
     text = str(
         value
     ).strip()
 
+    if not text:
+        return None
+
     if re.fullmatch(
         r"\d+",
         text,
     ):
+        number = int(
+            text
+        )
+
+        if number <= 0:
+            return None
+
         return (
-            float(text)
-            / 100
+            number / 100
         )
 
     return clean_price(
@@ -1070,9 +1134,281 @@ def shopify_price(
     )
 
 
-async def scrape_wraith_shopify(
+def shopify_option_names(
+    product,
+):
+    raw_options = (
+        product.get(
+            "options"
+        )
+        or []
+    )
+
+    names = []
+
+    for index, option in enumerate(
+        raw_options
+    ):
+
+        if isinstance(
+            option,
+            dict,
+        ):
+            name = (
+                option.get("name")
+                or option.get("title")
+                or f"Seçenek {index + 1}"
+            )
+
+        else:
+            name = str(
+                option
+            )
+
+        names.append(
+            name
+        )
+
+    return names
+
+
+def shopify_variant_values(
+    variant,
+):
+    options = variant.get(
+        "options"
+    )
+
+    if isinstance(
+        options,
+        list,
+    ):
+        return options
+
+    return [
+        variant.get("option1"),
+        variant.get("option2"),
+        variant.get("option3"),
+    ]
+
+
+def extract_shopify_variants(
+    product,
+    selected,
+):
+    names = shopify_option_names(
+        product
+    )
+
+    values = shopify_variant_values(
+        selected
+    )
+
+    result = {}
+
+    for index, raw_value in enumerate(
+        values
+    ):
+        if raw_value is None:
+            continue
+
+        value = str(
+            raw_value
+        ).strip()
+
+        if not value:
+            continue
+
+        if (
+            normalize_text(value)
+            == "default title"
+        ):
+            continue
+
+        raw_label = (
+            names[index]
+            if index < len(names)
+            else f"Seçenek {index + 1}"
+        )
+
+        label = infer_variant_label(
+            raw_label,
+            value,
+            index,
+        )
+
+        value = pretty_variant_value(
+            label,
+            value,
+        )
+
+        if not value:
+            continue
+
+        # Aynı label iki kere gelirse ezme.
+        final_label = label
+
+        if final_label in result:
+            final_label = (
+                f"{label} {index + 1}"
+            )
+
+        result[
+            final_label
+        ] = value
+
+    return result
+
+
+def extract_shopify_image(
+    product,
+    selected,
+):
+    # =====================================================
+    # VARIANT IMAGE
+    # =====================================================
+
+    featured = selected.get(
+        "featured_image"
+    )
+
+    if isinstance(
+        featured,
+        dict,
+    ):
+        image = (
+            featured.get("src")
+            or featured.get("url")
+        )
+
+        if image:
+            return normalize_image_url(
+                image
+            )
+
+    elif isinstance(
+        featured,
+        str,
+    ):
+        return normalize_image_url(
+            featured
+        )
+
+    # =====================================================
+    # MEDIA
+    # =====================================================
+
+    media = selected.get(
+        "featured_media"
+    )
+
+    if isinstance(
+        media,
+        dict,
+    ):
+        preview_image = (
+            media.get(
+                "preview_image"
+            )
+        )
+
+        if isinstance(
+            preview_image,
+            dict,
+        ):
+            image = (
+                preview_image.get(
+                    "src"
+                )
+                or preview_image.get(
+                    "url"
+                )
+            )
+
+            if image:
+                return normalize_image_url(
+                    image
+                )
+
+    # =====================================================
+    # PRODUCT FEATURED IMAGE
+    # =====================================================
+
+    product_image = (
+        product.get(
+            "featured_image"
+        )
+    )
+
+    if isinstance(
+        product_image,
+        str,
+    ):
+        return normalize_image_url(
+            product_image
+        )
+
+    if isinstance(
+        product_image,
+        dict,
+    ):
+        image = (
+            product_image.get("src")
+            or product_image.get("url")
+        )
+
+        if image:
+            return normalize_image_url(
+                image
+            )
+
+    # =====================================================
+    # FIRST IMAGE
+    # =====================================================
+
+    images = (
+        product.get(
+            "images"
+        )
+        or []
+    )
+
+    if images:
+
+        first = images[0]
+
+        if isinstance(
+            first,
+            str,
+        ):
+            return normalize_image_url(
+                first
+            )
+
+        if isinstance(
+            first,
+            dict,
+        ):
+            return normalize_image_url(
+                first.get("src")
+                or first.get("url")
+            )
+
+    return None
+
+
+async def scrape_shopify_product(
     url,
 ):
+    """
+    DOMAIN BAĞIMSIZ SHOPIFY SCRAPER
+
+    Wraith
+    Neeko
+    ve başka Shopify siteleri
+    buradan geçer.
+    """
+
     parsed = urlparse(
         url
     )
@@ -1081,118 +1417,173 @@ async def scrape_wraith_shopify(
         parsed.query
     )
 
-    variant_id = (
+    selected_variant_id = (
         query.get(
             "variant",
             [None],
         )[0]
     )
 
-    # Product .js endpoint.
-    clean_path = (
-        parsed.path.rstrip("/")
-    )
-
-    js_url = (
-        f"{parsed.scheme}"
-        f"://{parsed.netloc}"
-        f"{clean_path}.js"
+    json_url = (
+        shopify_product_json_url(
+            url
+        )
     )
 
     print(
-        "WRAITH SHOPIFY:",
-        js_url,
+        "SHOPIFY TRY:",
+        json_url,
     )
 
-    async with (
-        httpx.AsyncClient(
-            headers=HEADERS,
-            timeout=8,
-            follow_redirects=True,
-        )
+    headers = dict(
+        HEADERS
+    )
+
+    headers["Accept"] = (
+        "application/json,"
+        "text/javascript,"
+        "*/*;q=0.8"
+    )
+
+    async with httpx.AsyncClient(
+        headers=headers,
+        timeout=10,
+        follow_redirects=True,
     ) as client:
 
-        response = (
-            await client.get(
-                js_url
-            )
+        response = await client.get(
+            json_url
+        )
+
+        print(
+            "SHOPIFY STATUS:",
+            response.status_code,
         )
 
         response.raise_for_status()
 
-        product = (
-            response.json()
+        content_type = (
+            response.headers.get(
+                "content-type",
+                "",
+            )
+            .lower()
         )
+
+        # JSON parse etmeyi yine deniyoruz,
+        # bazı Shopify mağazaları yanlış
+        # content-type döndürebiliyor.
+        try:
+            product = (
+                response.json()
+            )
+
+        except Exception:
+            raise RuntimeError(
+                "Shopify product.js JSON döndürmedi."
+            )
 
     if not isinstance(
         product,
         dict,
     ):
         raise RuntimeError(
-            "Wraith ürün JSON'u okunamadı."
+            "Shopify ürün verisi geçersiz."
         )
-
-    title = product.get(
-        "title"
-    )
-
-    brand = (
-        product.get(
-            "vendor"
-        )
-    )
 
     variants_list = (
         product.get(
             "variants"
         )
-        or []
     )
+
+    if not isinstance(
+        variants_list,
+        list,
+    ):
+        raise RuntimeError(
+            "Shopify variants bulunamadı."
+        )
+
+    if not variants_list:
+        raise RuntimeError(
+            "Shopify variants boş."
+        )
+
+    title = (
+        product.get(
+            "title"
+        )
+    )
+
+    if not title:
+        raise RuntimeError(
+            "Shopify ürün adı bulunamadı."
+        )
 
     selected = None
 
-    # URL exact variant içeriyorsa
-    # onu bul.
-    if variant_id:
-        for variant in (
-            variants_list
-        ):
+    # =====================================================
+    # URL'DEKI EXACT VARIANT
+    # =====================================================
+
+    if selected_variant_id:
+
+        for variant in variants_list:
+
+            if not isinstance(
+                variant,
+                dict,
+            ):
+                continue
+
             if (
                 str(
-                    variant.get(
-                        "id"
-                    )
+                    variant.get("id")
                 )
                 ==
                 str(
-                    variant_id
+                    selected_variant_id
                 )
             ):
                 selected = variant
                 break
 
-    # Variant yoksa ilk available.
+    # =====================================================
+    # URL VARIANT YOKSA AVAILABLE
+    # =====================================================
+
     if selected is None:
-        for variant in (
-            variants_list
-        ):
+
+        for variant in variants_list:
+
+            if not isinstance(
+                variant,
+                dict,
+            ):
+                continue
+
             if variant.get(
                 "available"
             ):
                 selected = variant
                 break
 
-    if (
-        selected is None
-        and variants_list
-    ):
-        selected = (
-            variants_list[0]
-        )
+    # =====================================================
+    # SON ÇARE ILK VARIANT
+    # =====================================================
 
     if selected is None:
+        selected = variants_list[
+            0
+        ]
+
+    if not isinstance(
+        selected,
+        dict,
+    ):
         raise RuntimeError(
-            "Wraith varyantı bulunamadı."
+            "Shopify seçili varyant geçersiz."
         )
 
     price = shopify_price(
@@ -1202,155 +1593,24 @@ async def scrape_wraith_shopify(
     )
 
     if price is None:
+
+        price = shopify_price(
+            product.get(
+                "price"
+            )
+        )
+
+    if price is None:
         raise RuntimeError(
-            "Wraith varyant fiyatı alınamadı."
+            "Shopify varyant fiyatı bulunamadı."
         )
 
-    # =====================================================
-    # VARIANT LABELS
-    # =====================================================
-
-    option_names = []
-
-    raw_options = (
-        product.get(
-            "options"
-        )
-        or []
-    )
-
-    for index, option in enumerate(
-        raw_options
-    ):
-        if isinstance(
-            option,
-            dict,
-        ):
-            name = (
-                option.get(
-                    "name"
-                )
-                or
-                f"Seçenek {index + 1}"
-            )
-
-        else:
-            name = str(
-                option
-            )
-
-        option_names.append(
-            name
-        )
-
-    option_values = (
-        selected.get(
-            "options"
+    variants = (
+        extract_shopify_variants(
+            product,
+            selected,
         )
     )
-
-    if not isinstance(
-        option_values,
-        list,
-    ):
-        option_values = [
-            selected.get(
-                "option1"
-            ),
-
-            selected.get(
-                "option2"
-            ),
-
-            selected.get(
-                "option3"
-            ),
-        ]
-
-    variants = {}
-
-    for index, value in enumerate(
-        option_values
-    ):
-        if value is None:
-            continue
-
-        value = str(
-            value
-        ).strip()
-
-        if (
-            not value
-            or
-            normalize_text(
-                value
-            )
-            == "default title"
-        ):
-            continue
-
-        if index < len(
-            option_names
-        ):
-            name = (
-                option_names[
-                    index
-                ]
-            )
-
-        else:
-            name = (
-                f"Seçenek {index + 1}"
-            )
-
-        # Türkçeleştirme / düzeltme.
-        name_norm = (
-            normalize_text(
-                name
-            )
-        )
-
-        label_map = {
-            "surface":
-                "Yüzey",
-
-            "yuzey":
-                "Yüzey",
-
-            "size":
-                "Boyut",
-
-            "boyut":
-                "Boyut",
-
-            "color":
-                "Renk",
-
-            "colour":
-                "Renk",
-
-            "renk":
-                "Renk",
-        }
-
-        label = (
-            label_map.get(
-                name_norm,
-                name,
-            )
-        )
-
-        pretty = (
-            pretty_variant_value(
-                label,
-                value,
-            )
-        )
-
-        if pretty:
-            variants[
-                label
-            ] = pretty
 
     variant_text = (
         make_variant_text(
@@ -1358,161 +1618,105 @@ async def scrape_wraith_shopify(
         )
     )
 
-    # =====================================================
-    # IMAGE
-    # =====================================================
-
-    image_url = None
-
-    featured = (
-        selected.get(
-            "featured_image"
+    image_url = (
+        extract_shopify_image(
+            product,
+            selected,
         )
     )
 
-    if isinstance(
-        featured,
-        dict,
-    ):
-        image_url = (
-            featured.get(
-                "src"
-            )
-            or featured.get(
-                "url"
-            )
+    brand = (
+        product.get(
+            "vendor"
         )
+    )
 
-    elif isinstance(
-        featured,
-        str,
-    ):
-        image_url = featured
-
-    if not image_url:
-        media = (
-            selected.get(
-                "featured_media"
-            )
+    variant_id = (
+        selected.get(
+            "id"
         )
+    )
 
-        if isinstance(
-            media,
-            dict,
-        ):
-            preview_image = (
-                media.get(
-                    "preview_image"
-                )
+    store = detect_store(
+        url
+    )
+
+    # detect_store tanımazsa
+    # hostname'den düzgün isim.
+    if not store:
+        store = (
+            parsed.netloc
+            .replace(
+                "www.",
+                ""
             )
-
-            if isinstance(
-                preview_image,
-                dict,
-            ):
-                image_url = (
-                    preview_image.get(
-                        "src"
-                    )
-                )
-
-    if not image_url:
-        product_image = (
-            product.get(
-                "featured_image"
-            )
+            .split(".")[0]
+            .title()
         )
-
-        if isinstance(
-            product_image,
-            str,
-        ):
-            image_url = (
-                product_image
-            )
-
-        elif isinstance(
-            product_image,
-            dict,
-        ):
-            image_url = (
-                product_image.get(
-                    "src"
-                )
-            )
-
-    if not image_url:
-        images = (
-            product.get(
-                "images"
-            )
-            or []
-        )
-
-        if images:
-            first = images[0]
-
-            if isinstance(
-                first,
-                str,
-            ):
-                image_url = first
-
-            elif isinstance(
-                first,
-                dict,
-            ):
-                image_url = (
-                    first.get(
-                        "src"
-                    )
-                )
 
     print(
-        "WRAITH VARIANTS:",
+        "=========================="
+    )
+
+    print(
+        "SHOPIFY SUCCESS:",
+        store,
+    )
+
+    print(
+        "SHOPIFY PRODUCT:",
+        title,
+    )
+
+    print(
+        "SHOPIFY VARIANT ID:",
+        variant_id,
+    )
+
+    print(
+        "SHOPIFY VARIANTS:",
         variants,
     )
 
     print(
-        "WRAITH PRICE:",
+        "SHOPIFY VARIANT TEXT:",
+        variant_text,
+    )
+
+    print(
+        "SHOPIFY PRICE:",
         price,
     )
 
+    print(
+        "SHOPIFY IMAGE:",
+        image_url,
+    )
+
+    print(
+        "=========================="
+    )
+
     return ScrapedProduct(
-        title=(
-            title
-            or "Wraith Ürünü"
-        )[:500],
-
-        store="Wraith",
-
-        # URL'yi aynen koru.
-        # variant ID kaybolmasın.
+        title=title[:500],
+        store=store,
         url=url,
-
         price=price,
-
         image_url=image_url,
-
         brand=brand,
-
-        model=str(
-            selected.get(
-                "id"
-            )
-            or ""
+        model=(
+            str(variant_id)
+            if variant_id
+            else None
         ),
-
         variants=variants,
-
         variant_text=variant_text,
-
-        method="wraith-shopify",
+        method="generic-shopify",
     )
 
 
 # =========================================================
-# NORMAL HTML
+# HTML PARSER
 # =========================================================
 
 def extract_html_data(
@@ -1529,16 +1733,18 @@ def extract_html_data(
     brand = None
     model = None
 
-    for script in (
-        soup.find_all(
-            "script",
-            type="application/ld+json",
-        )
+    # =====================================================
+    # JSON LD
+    # =====================================================
+
+    for script in soup.find_all(
+        "script",
+        type="application/ld+json",
     ):
+
         raw = (
             script.string
-            or
-            script.get_text(
+            or script.get_text(
                 strip=True
             )
         )
@@ -1550,14 +1756,11 @@ def extract_html_data(
             payload = json.loads(
                 raw
             )
-
         except Exception:
             continue
 
-        product = (
-            walk_for_product(
-                payload
-            )
+        product = walk_for_product(
+            payload
         )
 
         if not product:
@@ -1602,9 +1805,7 @@ def extract_html_data(
                 dict,
             ):
                 image_url = (
-                    first.get(
-                        "url"
-                    )
+                    first.get("url")
                     or first.get(
                         "contentUrl"
                     )
@@ -1615,9 +1816,7 @@ def extract_html_data(
             dict,
         ):
             image_url = (
-                image.get(
-                    "url"
-                )
+                image.get("url")
                 or image.get(
                     "contentUrl"
                 )
@@ -1646,15 +1845,9 @@ def extract_html_data(
             brand = brand_data
 
         model = (
-            product.get(
-                "model"
-            )
-            or product.get(
-                "sku"
-            )
-            or product.get(
-                "mpn"
-            )
+            product.get("model")
+            or product.get("sku")
+            or product.get("mpn")
         )
 
         offers = (
@@ -1675,6 +1868,7 @@ def extract_html_data(
             offers,
             list,
         ):
+
             for offer in offers:
 
                 if not isinstance(
@@ -1683,20 +1877,16 @@ def extract_html_data(
                 ):
                     continue
 
-                candidate = (
-                    clean_price(
-                        offer.get(
-                            "price"
-                        )
-                        or offer.get(
-                            "lowPrice"
-                        )
-                        or offer.get(
-                            "salePrice"
-                        )
-                        or offer.get(
-                            "sellingPrice"
-                        )
+                candidate = clean_price(
+                    offer.get("price")
+                    or offer.get(
+                        "lowPrice"
+                    )
+                    or offer.get(
+                        "salePrice"
+                    )
+                    or offer.get(
+                        "sellingPrice"
                     )
                 )
 
@@ -1704,37 +1894,73 @@ def extract_html_data(
                     price = candidate
                     break
 
+    # =====================================================
+    # TITLE
+    # =====================================================
+
     if not title:
 
-        node = (
-            soup.find(
-                "meta",
-                property="og:title",
-            )
-        )
+        for attrs in [
+            {
+                "property":
+                    "og:title"
+            },
+            {
+                "name":
+                    "twitter:title"
+            },
+        ]:
 
-        if node:
-            title = (
-                node.get(
+            node = soup.find(
+                "meta",
+                attrs=attrs,
+            )
+
+            if node:
+                value = node.get(
                     "content"
                 )
-            )
+
+                if value:
+                    title = (
+                        value.strip()
+                    )
+                    break
+
+    # =====================================================
+    # IMAGE
+    # =====================================================
 
     if not image_url:
 
-        node = (
-            soup.find(
-                "meta",
-                property="og:image",
-            )
-        )
+        for attrs in [
+            {
+                "property":
+                    "og:image"
+            },
+            {
+                "name":
+                    "twitter:image"
+            },
+        ]:
 
-        if node:
-            image_url = (
-                node.get(
+            node = soup.find(
+                "meta",
+                attrs=attrs,
+            )
+
+            if node:
+                value = node.get(
                     "content"
                 )
-            )
+
+                if value:
+                    image_url = value
+                    break
+
+    # =====================================================
+    # PRICE
+    # =====================================================
 
     if price is None:
 
@@ -1743,24 +1969,17 @@ def extract_html_data(
             'meta[property="og:price:amount"]',
             'meta[itemprop="price"]',
         ]:
-            node = (
-                soup.select_one(
-                    selector
-                )
+
+            node = soup.select_one(
+                selector
             )
 
             if not node:
                 continue
 
-            candidate = (
-                clean_price(
-                    node.get(
-                        "content"
-                    )
-                    or node.get(
-                        "value"
-                    )
-                )
+            candidate = clean_price(
+                node.get("content")
+                or node.get("value")
             )
 
             if candidate:
@@ -1772,8 +1991,7 @@ def extract_html_data(
         and soup.title
     ):
         title = (
-            soup.title
-            .get_text(
+            soup.title.get_text(
                 " ",
                 strip=True,
             )
@@ -1782,10 +2000,10 @@ def extract_html_data(
     return {
         "title": title,
         "price": price,
-
         "image_url":
-            image_url,
-
+            normalize_image_url(
+                image_url
+            ),
         "brand": brand,
         "model": model,
     }
@@ -1798,20 +2016,14 @@ def extract_html_data(
 async def scrape_http(
     url,
 ):
-    async with (
-        httpx.AsyncClient(
-            headers=HEADERS,
-
-            follow_redirects=True,
-
-            timeout=HTTP_TIMEOUT,
-        )
+    async with httpx.AsyncClient(
+        headers=HEADERS,
+        follow_redirects=True,
+        timeout=HTTP_TIMEOUT,
     ) as client:
 
-        response = (
-            await client.get(
-                url
-            )
+        response = await client.get(
+            url
         )
 
         response.raise_for_status()
@@ -1820,10 +2032,8 @@ async def scrape_http(
             response.url
         )
 
-        data = (
-            extract_html_data(
-                response.text
-            )
+        data = extract_html_data(
+            response.text
         )
 
         return (
@@ -1833,74 +2043,8 @@ async def scrape_http(
 
 
 # =========================================================
-# MEYER
+# MEYER VARIANTLARI
 # =========================================================
-
-def get_meyer_variants(
-    url,
-):
-    query = parse_qs(
-        urlparse(
-            url
-        ).query
-    )
-
-    def get_value(
-        name,
-    ):
-        value = (
-            query.get(
-                name,
-                [None],
-            )[0]
-        )
-
-        if value is None:
-            return None
-
-        return unquote(
-            str(value)
-        ).strip()
-
-    raw = {
-        "Yüzey":
-            get_value(
-                "yuzey"
-            ),
-
-        "Boyut":
-            get_value(
-                "boyut"
-            ),
-
-        "Renk":
-            get_value(
-                "renk"
-            ),
-    }
-
-    variants = {}
-
-    for key, value in (
-        raw.items()
-    ):
-        if not value:
-            continue
-
-        pretty = (
-            pretty_variant_value(
-                key,
-                value,
-            )
-        )
-
-        if pretty:
-            variants[
-                key
-            ] = pretty
-
-    return variants
-
 
 def get_meyer_raw_variants(
     url,
@@ -1911,15 +2055,19 @@ def get_meyer_raw_variants(
         ).query
     )
 
-    def get_value(
-        name,
-    ):
-        return (
-            query.get(
-                name,
-                [None],
-            )[0]
-        )
+    def get_value(name):
+
+        value = query.get(
+            name,
+            [None],
+        )[0]
+
+        if value is None:
+            return None
+
+        return unquote(
+            str(value)
+        ).strip()
 
     return {
         "yuzey":
@@ -1938,6 +2086,47 @@ def get_meyer_raw_variants(
             ),
     }
 
+
+def get_meyer_variants(
+    url,
+):
+    raw = get_meyer_raw_variants(
+        url
+    )
+
+    variants = {}
+
+    mapping = {
+        "yuzey": "Yüzey",
+        "boyut": "Boyut",
+        "renk": "Renk",
+    }
+
+    for key, value in raw.items():
+
+        if not value:
+            continue
+
+        label = mapping[
+            key
+        ]
+
+        pretty = pretty_variant_value(
+            label,
+            value,
+        )
+
+        if pretty:
+            variants[
+                label
+            ] = pretty
+
+    return variants
+
+
+# =========================================================
+# MEYER CLICK
+# =========================================================
 
 async def meyer_click_variant(
     page,
@@ -1971,6 +2160,11 @@ async def meyer_click_variant(
             "x-soft",
         ],
 
+        "x soft": [
+            "xsoft",
+            "x-soft",
+        ],
+
         "mid": [
             "mid",
         ],
@@ -1996,23 +2190,17 @@ async def meyer_click_variant(
         ],
     }
 
-    targets = (
-        aliases.get(
-            target,
-            [target],
-        )
+    targets = aliases.get(
+        target,
+        [target],
     )
 
-    result = (
-        await page.evaluate(
-            """
-            (targets) => {
+    result = await page.evaluate(
+        """
+        (targets) => {
 
-                function norm(value) {
-
-                    return (
-                        value || ""
-                    )
+            function norm(value) {
+                return (value || "")
                     .toString()
                     .toLowerCase()
                     .replaceAll("ı","i")
@@ -2023,108 +2211,92 @@ async def meyer_click_variant(
                     .replaceAll("ç","c")
                     .replace(/\\s+/g," ")
                     .trim();
+            }
+
+            const wanted =
+                targets.map(norm);
+
+            const nodes =
+                Array.from(
+                    document.querySelectorAll(
+                        'button,[role="button"],label'
+                    )
+                );
+
+            for (const node of nodes) {
+
+                const rect =
+                    node.getBoundingClientRect();
+
+                if (
+                    rect.width <= 0
+                    ||
+                    rect.height <= 0
+                ) {
+                    continue;
                 }
 
-                const wanted =
-                    targets.map(norm);
+                const values = [
+                    node.innerText,
+                    node.textContent,
+                    node.getAttribute(
+                        "aria-label"
+                    ),
+                    node.getAttribute(
+                        "title"
+                    ),
+                    node.getAttribute(
+                        "value"
+                    ),
+                    node.getAttribute(
+                        "data-value"
+                    ),
+                    node.getAttribute(
+                        "data-name"
+                    ),
+                ]
+                .filter(Boolean)
+                .map(norm);
 
-                const nodes =
-                    Array.from(
-                        document
-                        .querySelectorAll(
-                            'button,[role="button"],label'
-                        )
+                const matched =
+                    wanted.some(
+                        target =>
+                            values.some(
+                                value =>
+                                    value
+                                    ===
+                                    target
+                            )
                     );
 
-                for (
-                    const node
-                    of nodes
-                ) {
-
-                    const rect =
-                        node
-                        .getBoundingClientRect();
-
-                    if (
-                        rect.width <= 0
-                        ||
-                        rect.height <= 0
-                    ) {
-                        continue;
-                    }
-
-                    const values = [
-
-                        node.innerText,
-
-                        node.textContent,
-
-                        node.getAttribute(
-                            "aria-label"
-                        ),
-
-                        node.getAttribute(
-                            "title"
-                        ),
-
-                        node.getAttribute(
-                            "value"
-                        ),
-
-                        node.getAttribute(
-                            "data-value"
-                        ),
-
-                        node.getAttribute(
-                            "data-name"
-                        ),
-
-                    ]
-                    .filter(Boolean)
-                    .map(norm);
-
-                    const matched =
-                        wanted.some(
-                            target =>
-                                values.some(
-                                    value =>
-                                        value
-                                        ===
-                                        target
-                                )
-                        );
-
-                    if (!matched) {
-                        continue;
-                    }
-
-                    node.scrollIntoView({
-                        block:"center",
-                        inline:"center"
-                    });
-
-                    node.click();
-
-                    return {
-                        success:true,
-
-                        text:
-                            node.innerText
-                            ||
-                            node.textContent
-                            ||
-                            ""
-                    };
+                if (!matched) {
+                    continue;
                 }
 
+                node.scrollIntoView({
+                    block:"center",
+                    inline:"center"
+                });
+
+                node.click();
+
                 return {
-                    success:false
+                    success:true,
+                    text:
+                        node.innerText
+                        ||
+                        node.textContent
+                        ||
+                        ""
                 };
             }
-            """,
 
-            targets,
-        )
+            return {
+                success:false
+            };
+        }
+        """,
+        targets,
     )
 
     if result.get(
@@ -2132,9 +2304,7 @@ async def meyer_click_variant(
     ):
         print(
             "MEYER CLICKED:",
-            result.get(
-                "text"
-            ),
+            result.get("text"),
         )
 
         await page.wait_for_timeout(
@@ -2151,104 +2321,88 @@ async def meyer_click_variant(
     return False
 
 
+# =========================================================
+# MEYER TITLE
+# =========================================================
+
 async def meyer_get_title(
     page,
     original_url,
 ):
     try:
-        result = (
-            await page.evaluate(
-                """
-                () => {
+        result = await page.evaluate(
+            """
+            () => {
 
-                    const nodes =
-                        Array.from(
-                            document
-                            .querySelectorAll(
-                                "h1"
-                            )
-                        );
+                const nodes =
+                    Array.from(
+                        document.querySelectorAll(
+                            "h1"
+                        )
+                    );
 
-                    for (
-                        const node
-                        of nodes
+                for (const node of nodes) {
+
+                    const r =
+                        node.getBoundingClientRect();
+
+                    if (
+                        r.width <= 0
+                        ||
+                        r.height <= 0
                     ) {
-
-                        const r =
-                            node
-                            .getBoundingClientRect();
-
-                        if (
-                            r.width <= 0
-                            ||
-                            r.height <= 0
-                        ) {
-                            continue;
-                        }
-
-                        const text =
-                            (
-                                node.innerText
-                                ||
-                                node.textContent
-                                ||
-                                ""
-                            ).trim();
-
-                        if (text) {
-                            return text;
-                        }
+                        continue;
                     }
 
-                    return null;
+                    const text =
+                        (
+                            node.innerText
+                            ||
+                            node.textContent
+                            ||
+                            ""
+                        ).trim();
+
+                    if (text) {
+                        return text;
+                    }
                 }
-                """
-            )
+
+                return null;
+            }
+            """
         )
 
         if result:
-            return (
-                result.strip()
-            )
+            return result.strip()
 
     except Exception:
         pass
 
     try:
-        title = (
-            await page.locator(
-                'meta[property="og:title"]'
-            )
-            .get_attribute(
-                "content",
-
-                timeout=1000,
-            )
+        title = await page.locator(
+            'meta[property="og:title"]'
+        ).get_attribute(
+            "content",
+            timeout=1000,
         )
 
         if title:
-            return (
-                title.strip()
-            )
+            return title.strip()
 
     except Exception:
         pass
 
     try:
-        title = (
-            await page.title()
-        )
+        title = await page.title()
 
         if title:
-            title = (
-                re.sub(
-                    r"\s*[-|]\s*Meyer.*$",
-                    "",
-                    title,
-                    flags=re.I,
-                )
-                .strip()
-            )
+            title = re.sub(
+                r"\s*[-|]\s*Meyer.*$",
+                "",
+                title,
+                flags=re.I,
+            ).strip()
 
             if title:
                 return title
@@ -2257,43 +2411,31 @@ async def meyer_get_title(
         pass
 
     try:
-        path = (
-            urlparse(
-                original_url
-            )
-            .path
-            .strip("/")
-        )
+        path = urlparse(
+            original_url
+        ).path.strip("/")
 
         slug = (
-            path
-            .split("/")[-1]
+            path.split("/")[-1]
         )
 
         slug = unquote(
             slug
         )
 
-        slug = (
-            slug.replace(
-                "-",
-                " ",
-            )
+        slug = slug.replace(
+            "-",
+            " ",
         )
 
-        slug = (
-            re.sub(
-                r"\s+",
-                " ",
-                slug,
-            )
-            .strip()
-        )
+        slug = re.sub(
+            r"\s+",
+            " ",
+            slug,
+        ).strip()
 
         if slug:
-            return (
-                slug.title()
-            )
+            return slug.title()
 
     except Exception:
         pass
@@ -2301,185 +2443,172 @@ async def meyer_get_title(
     return "Meyer Ürünü"
 
 
+# =========================================================
+# MEYER PRICE
+# =========================================================
+
 async def meyer_get_price(
     page,
 ):
     try:
-        result = (
-            await page.evaluate(
-                """
-                () => {
+        result = await page.evaluate(
+            """
+            () => {
 
-                    function visible(el) {
+                function visible(el) {
 
-                        if (!el) {
-                            return false;
-                        }
-
-                        const r =
-                            el
-                            .getBoundingClientRect();
-
-                        return (
-                            r.width > 0
-                            &&
-                            r.height > 0
-                        );
+                    if (!el) {
+                        return false;
                     }
 
-                    const h1 =
-                        Array.from(
-                            document
-                            .querySelectorAll(
-                                "h1"
-                            )
+                    const r =
+                        el.getBoundingClientRect();
+
+                    return (
+                        r.width > 0
+                        &&
+                        r.height > 0
+                    );
+                }
+
+                const h1 =
+                    Array.from(
+                        document.querySelectorAll(
+                            "h1"
                         )
-                        .find(visible);
+                    ).find(visible);
 
-                    const titleRect =
-                        h1
-                        ?
-                        h1.getBoundingClientRect()
-                        :
-                        null;
+                const titleRect =
+                    h1
+                    ?
+                    h1.getBoundingClientRect()
+                    :
+                    null;
 
-                    const selectors = [
+                const selectors = [
+                    "div.text-xl.font-medium",
+                    ".text-xl.font-medium",
+                    '[class*="product"] [class*="price"]',
+                    '[class*="Product"] [class*="price"]'
+                ];
 
-                        "div.text-xl.font-medium",
+                const results = [];
+                const seen = new Set();
 
-                        ".text-xl.font-medium",
+                for (
+                    const selector
+                    of selectors
+                ) {
 
-                        '[class*="product"] [class*="price"]',
+                    let nodes;
 
-                        '[class*="Product"] [class*="price"]'
+                    try {
+                        nodes =
+                            document.querySelectorAll(
+                                selector
+                            );
+                    }
+                    catch {
+                        continue;
+                    }
 
-                    ];
+                    for (const el of nodes) {
 
-                    const results = [];
-                    const seen = new Set();
-
-                    for (
-                        const selector
-                        of selectors
-                    ) {
-
-                        let nodes;
-
-                        try {
-                            nodes =
-                                document
-                                .querySelectorAll(
-                                    selector
-                                );
-                        }
-                        catch {
+                        if (
+                            seen.has(el)
+                            ||
+                            !visible(el)
+                        ) {
                             continue;
                         }
 
-                        for (
-                            const el
-                            of nodes
+                        seen.add(el);
+
+                        const text =
+                            (
+                                el.innerText
+                                ||
+                                el.textContent
+                                ||
+                                ""
+                            ).trim();
+
+                        if (
+                            !/TL/i.test(text)
+                            ||
+                            !/\\d/.test(text)
                         ) {
-
-                            if (
-                                seen.has(el)
-                                ||
-                                !visible(el)
-                            ) {
-                                continue;
-                            }
-
-                            seen.add(el);
-
-                            const text =
-                                (
-                                    el.innerText
-                                    ||
-                                    el.textContent
-                                    ||
-                                    ""
-                                ).trim();
-
-                            if (
-                                !/TL/i.test(text)
-                                ||
-                                !/\\d/.test(text)
-                            ) {
-                                continue;
-                            }
-
-                            const r =
-                                el
-                                .getBoundingClientRect();
-
-                            let score = 0;
-
-                            if (
-                                el.classList
-                                .contains(
-                                    "text-xl"
-                                )
-                            ) {
-                                score += 2000;
-                            }
-
-                            if (
-                                el.classList
-                                .contains(
-                                    "font-medium"
-                                )
-                            ) {
-                                score += 1500;
-                            }
-
-                            if (titleRect) {
-
-                                const ty =
-                                    titleRect.top
-                                    +
-                                    titleRect.height / 2;
-
-                                const py =
-                                    r.top
-                                    +
-                                    r.height / 2;
-
-                                const dy =
-                                    Math.abs(
-                                        ty - py
-                                    );
-
-                                score +=
-                                    Math.max(
-                                        0,
-                                        2000 - dy
-                                    );
-                            }
-
-                            results.push({
-                                text,
-                                score
-                            });
+                            continue;
                         }
+
+                        const r =
+                            el.getBoundingClientRect();
+
+                        let score = 0;
+
+                        if (
+                            el.classList.contains(
+                                "text-xl"
+                            )
+                        ) {
+                            score += 2000;
+                        }
+
+                        if (
+                            el.classList.contains(
+                                "font-medium"
+                            )
+                        ) {
+                            score += 1500;
+                        }
+
+                        if (titleRect) {
+
+                            const ty =
+                                titleRect.top
+                                +
+                                titleRect.height / 2;
+
+                            const py =
+                                r.top
+                                +
+                                r.height / 2;
+
+                            const dy =
+                                Math.abs(
+                                    ty - py
+                                );
+
+                            score +=
+                                Math.max(
+                                    0,
+                                    2000 - dy
+                                );
+                        }
+
+                        results.push({
+                            text,
+                            score
+                        });
                     }
-
-                    results.sort(
-                        (a,b) =>
-                            b.score
-                            -
-                            a.score
-                    );
-
-                    return (
-                        results.length
-                        ?
-                        results[0]
-                        :
-                        null
-                    );
                 }
-                """
-            )
+
+                results.sort(
+                    (a,b) =>
+                        b.score
+                        -
+                        a.score
+                );
+
+                return (
+                    results.length
+                    ?
+                    results[0]
+                    :
+                    null
+                );
+            }
+            """
         )
 
         if result:
@@ -2493,6 +2622,7 @@ async def meyer_get_price(
             )
 
             if price:
+
                 print(
                     "MEYER PRICE ELEMENT:",
                     text,
@@ -2506,74 +2636,76 @@ async def meyer_get_price(
             repr(e),
         )
 
-    # Fallback.
+    # =====================================================
+    # FALLBACK
+    # =====================================================
+
     try:
-        matches = (
-            await page.evaluate(
-                """
-                () => {
+        matches = await page.evaluate(
+            """
+            () => {
 
-                    const h1 =
-                        document
-                        .querySelector(
-                            "h1"
-                        );
+                const h1 =
+                    document.querySelector(
+                        "h1"
+                    );
 
-                    let root = h1;
+                let root = h1;
 
-                    for (
-                        let i=0;
-                        i<5 && root;
-                        i++
-                    ) {
+                for (
+                    let i=0;
+                    i<5 && root;
+                    i++
+                ) {
 
-                        if (
+                    if (
+                        root.innerText
+                        &&
+                        /\\d[\\d.,]*\\s*TL/i
+                        .test(
                             root.innerText
-                            &&
-                            /\\d[\\d.,]*\\s*TL/i
-                            .test(
-                                root.innerText
-                            )
-                        ) {
-                            break;
-                        }
-
-                        root =
-                            root.parentElement;
+                        )
+                    ) {
+                        break;
                     }
 
-                    const text =
-                        root
-                        ?
-                        root.innerText
-                        :
-                        document.body
-                        .innerText;
-
-                    return (
-                        text.match(
-                            /\\d[\\d.,]*\\s*TL/gi
-                        )
-                        ||
-                        []
-                    );
+                    root =
+                        root.parentElement;
                 }
-                """
-            )
+
+                const text =
+                    root
+                    ?
+                    root.innerText
+                    :
+                    document.body.innerText;
+
+                return (
+                    text.match(
+                        /\\d[\\d.,]*\\s*TL/gi
+                    )
+                    ||
+                    []
+                );
+            }
+            """
         )
 
-        for text in (
-            matches[:15]
-        ):
+        for text in matches[:15]:
+
             price = clean_price(
                 text
             )
 
             if (
                 price is not None
-                and
-                price > 20
+                and price > 20
             ):
+                print(
+                    "MEYER PRICE FALLBACK:",
+                    text,
+                )
+
                 return price
 
     except Exception:
@@ -2581,6 +2713,10 @@ async def meyer_get_price(
 
     return None
 
+
+# =========================================================
+# MEYER IMAGE
+# =========================================================
 
 async def meyer_get_image(
     page,
@@ -2591,223 +2727,190 @@ async def meyer_get_image(
     )
 
     try:
-        result = (
-            await page.evaluate(
-                """
-                (color) => {
+        result = await page.evaluate(
+            """
+            (color) => {
 
-                    function visible(el) {
+                function visible(el) {
 
-                        const r =
-                            el
-                            .getBoundingClientRect();
-
-                        return (
-                            r.width > 0
-                            &&
-                            r.height > 0
-                        );
-                    }
-
-                    const h1 =
-                        Array.from(
-                            document
-                            .querySelectorAll(
-                                "h1"
-                            )
-                        )
-                        .find(visible);
-
-                    const titleRect =
-                        h1
-                        ?
-                        h1.getBoundingClientRect()
-                        :
-                        null;
-
-                    const images =
-                        Array.from(
-                            document
-                            .querySelectorAll(
-                                'img[alt="Image"],img'
-                            )
-                        );
-
-                    const results = [];
-
-                    for (
-                        const img
-                        of images
-                    ) {
-
-                        if (!visible(img)) {
-                            continue;
-                        }
-
-                        const src =
-                            img.currentSrc
-                            ||
-                            img.src
-                            ||
-                            img.getAttribute(
-                                "data-src"
-                            )
-                            ||
-                            "";
-
-                        if (!src) {
-                            continue;
-                        }
-
-                        if (
-                            !src.includes(
-                                "cdn.myikas.com"
-                            )
-                        ) {
-                            continue;
-                        }
-
-                        const r =
-                            img
-                            .getBoundingClientRect();
-
-                        const area =
-                            r.width
-                            *
-                            r.height;
-
-                        if (
-                            area < 20000
-                        ) {
-                            continue;
-                        }
-
-                        let score =
-                            Math.min(
-                                area / 500,
-                                1500
-                            );
-
-                        if (titleRect) {
-
-                            const imageY =
-                                r.top
-                                +
-                                r.height / 2;
-
-                            const titleY =
-                                titleRect.top
-                                +
-                                titleRect.height / 2;
-
-                            const dy =
-                                Math.abs(
-                                    imageY
-                                    -
-                                    titleY
-                                );
-
-                            score +=
-                                Math.max(
-                                    0,
-                                    2000 - dy
-                                );
-
-                            if (
-                                r.left
-                                <
-                                titleRect.left
-                            ) {
-                                score += 700;
-                            }
-                        }
-
-                        const lower =
-                            src.toLowerCase();
-
-                        if (
-                            color
-                            ===
-                            "siyah"
-                        ) {
-
-                            if (
-                                lower.includes(
-                                    "-bk-"
-                                )
-                                ||
-                                lower.includes(
-                                    "_bk_"
-                                )
-                                ||
-                                lower.includes(
-                                    "black"
-                                )
-                                ||
-                                lower.includes(
-                                    "siyah"
-                                )
-                            ) {
-                                score += 5000;
-                            }
-                        }
-
-                        if (
-                            color
-                            ===
-                            "turuncu"
-                        ) {
-
-                            if (
-                                lower.includes(
-                                    "orange"
-                                )
-                                ||
-                                lower.includes(
-                                    "daidai"
-                                )
-                                ||
-                                lower.includes(
-                                    "-or-"
-                                )
-                            ) {
-                                score += 5000;
-                            }
-                        }
-
-                        results.push({
-                            src,
-                            score
-                        });
-                    }
-
-                    results.sort(
-                        (a,b) =>
-                            b.score
-                            -
-                            a.score
-                    );
+                    const r =
+                        el.getBoundingClientRect();
 
                     return (
-                        results.length
-                        ?
-                        results[0]
-                        :
-                        null
+                        r.width > 0
+                        &&
+                        r.height > 0
                     );
                 }
-                """,
 
-                color,
-            )
+                const h1 =
+                    Array.from(
+                        document.querySelectorAll(
+                            "h1"
+                        )
+                    ).find(visible);
+
+                const titleRect =
+                    h1
+                    ?
+                    h1.getBoundingClientRect()
+                    :
+                    null;
+
+                const images =
+                    Array.from(
+                        document.querySelectorAll(
+                            'img[alt="Image"],img'
+                        )
+                    );
+
+                const results = [];
+
+                for (const img of images) {
+
+                    if (!visible(img)) {
+                        continue;
+                    }
+
+                    const src =
+                        img.currentSrc
+                        ||
+                        img.src
+                        ||
+                        img.getAttribute(
+                            "data-src"
+                        )
+                        ||
+                        "";
+
+                    if (!src) {
+                        continue;
+                    }
+
+                    if (
+                        !src.includes(
+                            "cdn.myikas.com"
+                        )
+                    ) {
+                        continue;
+                    }
+
+                    const r =
+                        img.getBoundingClientRect();
+
+                    const area =
+                        r.width
+                        *
+                        r.height;
+
+                    if (area < 20000) {
+                        continue;
+                    }
+
+                    let score =
+                        Math.min(
+                            area / 500,
+                            1500
+                        );
+
+                    if (titleRect) {
+
+                        const imageY =
+                            r.top
+                            +
+                            r.height / 2;
+
+                        const titleY =
+                            titleRect.top
+                            +
+                            titleRect.height / 2;
+
+                        const dy =
+                            Math.abs(
+                                imageY
+                                -
+                                titleY
+                            );
+
+                        score +=
+                            Math.max(
+                                0,
+                                2000 - dy
+                            );
+
+                        if (
+                            r.left
+                            <
+                            titleRect.left
+                        ) {
+                            score += 700;
+                        }
+                    }
+
+                    const lower =
+                        src.toLowerCase();
+
+                    if (
+                        color === "siyah"
+                    ) {
+
+                        if (
+                            lower.includes("-bk-")
+                            ||
+                            lower.includes("_bk_")
+                            ||
+                            lower.includes("black")
+                            ||
+                            lower.includes("siyah")
+                        ) {
+                            score += 5000;
+                        }
+                    }
+
+                    if (
+                        color === "turuncu"
+                    ) {
+
+                        if (
+                            lower.includes("orange")
+                            ||
+                            lower.includes("daidai")
+                            ||
+                            lower.includes("-or-")
+                        ) {
+                            score += 5000;
+                        }
+                    }
+
+                    results.push({
+                        src,
+                        score
+                    });
+                }
+
+                results.sort(
+                    (a,b) =>
+                        b.score
+                        -
+                        a.score
+                );
+
+                return (
+                    results.length
+                    ?
+                    results[0]
+                    :
+                    null
+                );
+            }
+            """,
+            color,
         )
 
         if result:
 
-            src = (
-                result.get(
-                    "src"
-                )
+            src = result.get(
+                "src"
             )
 
             if src:
@@ -2825,19 +2928,20 @@ async def meyer_get_image(
         )
 
     try:
-        return (
-            await page.locator(
-                'meta[property="og:image"]'
-            )
-            .get_attribute(
-                "content",
-                timeout=800,
-            )
+        return await page.locator(
+            'meta[property="og:image"]'
+        ).get_attribute(
+            "content",
+            timeout=800,
         )
 
     except Exception:
         return None
 
+
+# =========================================================
+# MEYER ANA
+# =========================================================
 
 async def scrape_meyer(
     page,
@@ -2876,7 +2980,6 @@ async def scrape_meyer(
                     "button"
                 ).length > 3
             """,
-
             timeout=3500,
         )
 
@@ -2919,26 +3022,20 @@ async def scrape_meyer(
         400
     )
 
-    title = (
-        await meyer_get_title(
-            page,
-            original_url,
-        )
+    title = await meyer_get_title(
+        page,
+        original_url,
     )
 
-    price = (
-        await meyer_get_price(
-            page
-        )
+    price = await meyer_get_price(
+        page
     )
 
-    image_url = (
-        await meyer_get_image(
-            page,
-            raw_variants.get(
-                "renk"
-            ),
-        )
+    image_url = await meyer_get_image(
+        page,
+        raw_variants.get(
+            "renk"
+        ),
     )
 
     variant_text = (
@@ -2958,8 +3055,17 @@ async def scrape_meyer(
     )
 
     print(
+        "MEYER FINAL IMAGE:",
+        image_url,
+    )
+
+    print(
         "MEYER VARIANT TEXT:",
         variant_text,
+    )
+
+    print(
+        "=========================="
     )
 
     return {
@@ -2987,177 +3093,156 @@ async def scrape_meyer(
 
 
 # =========================================================
-# GENERIC BROWSER
+# SITE PRICE SELECTORS
 # =========================================================
 
 def get_price_selectors(
     store,
 ):
-    if (
-        store
-        == "Amazon Türkiye"
-    ):
+    if store == "Amazon Türkiye":
+
         return [
             ".priceToPay .a-offscreen",
-
             "#corePriceDisplay_desktop_feature_div .a-price .a-offscreen",
-
             "#corePrice_feature_div .a-price .a-offscreen",
-
             ".apexPriceToPay .a-offscreen",
-
             ".a-price .a-offscreen",
-
             "#priceblock_ourprice",
-
             "#priceblock_dealprice",
         ]
 
     if store == "Trendyol":
+
         return [
             ".prc-dsc",
-
             ".prc-slg",
-
             '[data-testid*="price"]',
-
             '[class*="price"]',
         ]
 
     if store == "N11":
+
         return [
             ".newPrice ins",
-
             ".price",
-
             '[class*="price"]',
         ]
 
     return [
         '[itemprop="price"]',
-
         '[class*="price"]',
     ]
 
+
+# =========================================================
+# BROWSER PRICE
+# =========================================================
 
 async def browser_find_price(
     page,
     store,
 ):
-    selectors = (
-        get_price_selectors(
-            store
-        )
+    selectors = get_price_selectors(
+        store
     )
 
     try:
-        results = (
-            await page.evaluate(
-                """
-                (selectors) => {
+        results = await page.evaluate(
+            """
+            (selectors) => {
 
-                    const output = [];
+                const output = [];
+
+                for (
+                    let priority=0;
+                    priority<selectors.length;
+                    priority++
+                ) {
+
+                    const selector =
+                        selectors[priority];
+
+                    let nodes;
+
+                    try {
+                        nodes =
+                            document.querySelectorAll(
+                                selector
+                            );
+                    }
+                    catch {
+                        continue;
+                    }
 
                     for (
-                        let priority=0;
-                        priority<selectors.length;
-                        priority++
+                        let i=0;
+                        i<Math.min(
+                            nodes.length,
+                            25
+                        );
+                        i++
                     ) {
 
-                        const selector =
-                            selectors[
-                                priority
-                            ];
+                        const node =
+                            nodes[i];
 
-                        let nodes;
+                        const r =
+                            node.getBoundingClientRect();
 
-                        try {
-                            nodes =
-                                document
-                                .querySelectorAll(
-                                    selector
-                                );
-                        }
-                        catch {
+                        if (
+                            r.width <= 0
+                            ||
+                            r.height <= 0
+                        ) {
                             continue;
                         }
 
-                        for (
-                            let i=0;
-                            i<Math.min(
-                                nodes.length,
-                                25
-                            );
-                            i++
-                        ) {
-
-                            const node =
-                                nodes[i];
-
-                            const r =
-                                node
-                                .getBoundingClientRect();
-
-                            if (
-                                r.width <= 0
+                        const text =
+                            (
+                                node.innerText
                                 ||
-                                r.height <= 0
-                            ) {
-                                continue;
-                            }
-
-                            const text =
-                                (
-                                    node.innerText
-                                    ||
-                                    node.textContent
-                                    ||
-                                    node.getAttribute(
-                                        "content"
-                                    )
-                                    ||
-                                    ""
-                                ).trim();
-
-                            if (
-                                !text
+                                node.textContent
                                 ||
-                                !/\\d/.test(
-                                    text
+                                node.getAttribute(
+                                    "content"
                                 )
-                            ) {
-                                continue;
-                            }
+                                ||
+                                ""
+                            ).trim();
 
-                            output.push({
-                                text,
-                                priority
-                            });
+                        if (
+                            !text
+                            ||
+                            !/\\d/.test(text)
+                        ) {
+                            continue;
                         }
+
+                        output.push({
+                            text,
+                            priority
+                        });
                     }
-
-                    output.sort(
-                        (a,b) =>
-                            a.priority
-                            -
-                            b.priority
-                    );
-
-                    return output;
                 }
-                """,
 
-                selectors,
-            )
+                output.sort(
+                    (a,b) =>
+                        a.priority
+                        -
+                        b.priority
+                );
+
+                return output;
+            }
+            """,
+            selectors,
         )
 
         for item in results:
 
-            price = (
-                clean_price(
-                    item.get(
-                        "text"
-                    )
+            price = clean_price(
+                item.get(
+                    "text"
                 )
             )
 
@@ -3170,92 +3255,86 @@ async def browser_find_price(
     return None
 
 
+# =========================================================
+# BROWSER TITLE
+# =========================================================
+
 async def browser_find_title(
     page,
 ):
     try:
-        title = (
-            await page.evaluate(
-                """
-                () => {
+        title = await page.evaluate(
+            """
+            () => {
 
-                    const selectors = [
+                const selectors = [
+                    "#productTitle",
+                    "h1",
+                    '[data-test-id="product-name"]',
+                    '[data-testid="product-name"]'
+                ];
 
-                        "#productTitle",
+                for (
+                    const selector
+                    of selectors
+                ) {
 
-                        "h1",
-
-                        '[data-test-id="product-name"]',
-
-                        '[data-testid="product-name"]'
-
-                    ];
-
-                    for (
-                        const selector
-                        of selectors
-                    ) {
-
-                        const nodes =
-                            document
-                            .querySelectorAll(
-                                selector
-                            );
-
-                        for (
-                            const node
-                            of nodes
-                        ) {
-
-                            const r =
-                                node
-                                .getBoundingClientRect();
-
-                            if (
-                                r.width <= 0
-                                ||
-                                r.height <= 0
-                            ) {
-                                continue;
-                            }
-
-                            const text =
-                                (
-                                    node.innerText
-                                    ||
-                                    node.textContent
-                                    ||
-                                    ""
-                                ).trim();
-
-                            if (text) {
-                                return text;
-                            }
-                        }
-                    }
-
-                    const meta =
-                        document
-                        .querySelector(
-                            'meta[property="og:title"]'
+                    const nodes =
+                        document.querySelectorAll(
+                            selector
                         );
 
-                    if (
-                        meta
-                        &&
-                        meta.content
+                    for (
+                        const node
+                        of nodes
                     ) {
-                        return meta.content;
-                    }
 
-                    return (
-                        document.title
-                        ||
-                        null
-                    );
+                        const r =
+                            node.getBoundingClientRect();
+
+                        if (
+                            r.width <= 0
+                            ||
+                            r.height <= 0
+                        ) {
+                            continue;
+                        }
+
+                        const text =
+                            (
+                                node.innerText
+                                ||
+                                node.textContent
+                                ||
+                                ""
+                            ).trim();
+
+                        if (text) {
+                            return text;
+                        }
+                    }
                 }
-                """
-            )
+
+                const meta =
+                    document.querySelector(
+                        'meta[property="og:title"]'
+                    );
+
+                if (
+                    meta
+                    &&
+                    meta.content
+                ) {
+                    return meta.content;
+                }
+
+                return (
+                    document.title
+                    ||
+                    null
+                );
+            }
+            """
         )
 
         if title:
@@ -3267,249 +3346,258 @@ async def browser_find_title(
     return None
 
 
+# =========================================================
+# BROWSER IMAGE
+# =========================================================
+
 async def browser_find_image(
     page,
 ):
     try:
-        return (
-            await page.evaluate(
-                """
-                () => {
+        result = await page.evaluate(
+            """
+            () => {
 
-                    const image =
-                        document
-                        .querySelector(
-                            "#landingImage"
-                        )
+                const image =
+                    document.querySelector(
+                        "#landingImage"
+                    )
+                    ||
+                    document.querySelector(
+                        'img[itemprop="image"]'
+                    );
+
+                if (image) {
+
+                    const src =
+                        image.currentSrc
                         ||
-                        document
-                        .querySelector(
-                            'img[itemprop="image"]'
+                        image.src
+                        ||
+                        image.getAttribute(
+                            "data-src"
                         );
 
-                    if (image) {
-
-                        const src =
-                            image.currentSrc
-                            ||
-                            image.src
-                            ||
-                            image.getAttribute(
-                                "data-src"
-                            );
-
-                        if (src) {
-                            return src;
-                        }
+                    if (src) {
+                        return src;
                     }
-
-                    const meta =
-                        document
-                        .querySelector(
-                            'meta[property="og:image"]'
-                        );
-
-                    if (
-                        meta
-                        &&
-                        meta.content
-                    ) {
-                        return meta.content;
-                    }
-
-                    return null;
                 }
-                """
-            )
+
+                const meta =
+                    document.querySelector(
+                        'meta[property="og:image"]'
+                    );
+
+                if (
+                    meta
+                    &&
+                    meta.content
+                ) {
+                    return meta.content;
+                }
+
+                return null;
+            }
+            """
+        )
+
+        return normalize_image_url(
+            result
         )
 
     except Exception:
         return None
 
 
+# =========================================================
+# GENERIC DOM VARIANT
+# =========================================================
+
 async def browser_find_variants(
     page,
 ):
     """
-    Diğer mağazalarda seçili select/radio
-    değerlerini yakalamaya çalışır.
-    Gürültülü sonuçları filtreler.
+    Shopify olmayan sitelerde de
+    seçili select / radio gibi
+    standart HTML kontrollerini yakala.
     """
 
     try:
-        data = (
-            await page.evaluate(
-                """
-                () => {
+        data = await page.evaluate(
+            """
+            () => {
 
-                    const result = [];
+                const result = [];
 
-                    function clean(v) {
-                        return (
-                            v || ""
-                        )
-                        .replace(/\\s+/g," ")
-                        .trim();
-                    }
-
-                    // SELECT
-                    for (
-                        const select
-                        of document
-                        .querySelectorAll(
-                            "select"
-                        )
-                    ) {
-
-                        const option =
-                            select
-                            .options[
-                                select.selectedIndex
-                            ];
-
-                        if (!option) {
-                            continue;
-                        }
-
-                        const value =
-                            clean(
-                                option.textContent
-                            );
-
-                        if (
-                            !value
-                            ||
-                            value.toLowerCase()
-                            === "seçiniz"
-                        ) {
-                            continue;
-                        }
-
-                        let label = "";
-
-                        if (select.id) {
-
-                            const l =
-                                document
-                                .querySelector(
-                                    `label[for="${select.id}"]`
-                                );
-
-                            if (l) {
-                                label =
-                                    clean(
-                                        l.textContent
-                                    );
-                            }
-                        }
-
-                        label =
-                            label
-                            ||
-                            select.getAttribute(
-                                "aria-label"
-                            )
-                            ||
-                            select.name
-                            ||
-                            "";
-
-                        result.push({
-                            label,
-                            value
-                        });
-                    }
-
-                    // CHECKED RADIO
-                    for (
-                        const input
-                        of document
-                        .querySelectorAll(
-                            'input[type="radio"]:checked'
-                        )
-                    ) {
-
-                        let value =
-                            input.value || "";
-
-                        let label = "";
-
-                        if (input.id) {
-
-                            const l =
-                                document
-                                .querySelector(
-                                    `label[for="${input.id}"]`
-                                );
-
-                            if (l) {
-                                value =
-                                    clean(
-                                        l.textContent
-                                    )
-                                    ||
-                                    value;
-                            }
-                        }
-
-                        const fieldset =
-                            input.closest(
-                                "fieldset"
-                            );
-
-                        if (fieldset) {
-
-                            const legend =
-                                fieldset
-                                .querySelector(
-                                    "legend"
-                                );
-
-                            if (legend) {
-                                label =
-                                    clean(
-                                        legend.textContent
-                                    );
-                            }
-                        }
-
-                        label =
-                            label
-                            ||
-                            input.name
-                            ||
-                            "";
-
-                        result.push({
-                            label,
-                            value
-                        });
-                    }
-
-                    return result;
+                function clean(v) {
+                    return (
+                        v || ""
+                    )
+                    .replace(/\\s+/g," ")
+                    .trim();
                 }
-                """
-            )
+
+                // =========================================
+                // SELECT
+                // =========================================
+
+                for (
+                    const select
+                    of document.querySelectorAll(
+                        "select"
+                    )
+                ) {
+
+                    const option =
+                        select.options[
+                            select.selectedIndex
+                        ];
+
+                    if (!option) {
+                        continue;
+                    }
+
+                    const value =
+                        clean(
+                            option.textContent
+                        );
+
+                    if (
+                        !value
+                        ||
+                        value.toLowerCase()
+                        ===
+                        "seçiniz"
+                    ) {
+                        continue;
+                    }
+
+                    let label = "";
+
+                    if (select.id) {
+
+                        const node =
+                            document.querySelector(
+                                `label[for="${select.id}"]`
+                            );
+
+                        if (node) {
+                            label =
+                                clean(
+                                    node.textContent
+                                );
+                        }
+                    }
+
+                    label =
+                        label
+                        ||
+                        select.getAttribute(
+                            "aria-label"
+                        )
+                        ||
+                        select.name
+                        ||
+                        "";
+
+                    result.push({
+                        label,
+                        value
+                    });
+                }
+
+                // =========================================
+                // RADIO
+                // =========================================
+
+                for (
+                    const input
+                    of document.querySelectorAll(
+                        'input[type="radio"]:checked'
+                    )
+                ) {
+
+                    let value =
+                        input.value
+                        ||
+                        "";
+
+                    let label = "";
+
+                    if (input.id) {
+
+                        const node =
+                            document.querySelector(
+                                `label[for="${input.id}"]`
+                            );
+
+                        if (node) {
+                            value =
+                                clean(
+                                    node.textContent
+                                )
+                                ||
+                                value;
+                        }
+                    }
+
+                    const fieldset =
+                        input.closest(
+                            "fieldset"
+                        );
+
+                    if (fieldset) {
+
+                        const legend =
+                            fieldset.querySelector(
+                                "legend"
+                            );
+
+                        if (legend) {
+                            label =
+                                clean(
+                                    legend.textContent
+                                );
+                        }
+                    }
+
+                    label =
+                        label
+                        ||
+                        input.name
+                        ||
+                        "";
+
+                    result.push({
+                        label,
+                        value
+                    });
+                }
+
+                return result;
+            }
+            """
         )
 
     except Exception:
         return {}
 
-    allowed_labels = {
+    variants = {}
+
+    allowed_keywords = {
         "renk": "Renk",
-
         "color": "Renk",
-
         "colour": "Renk",
 
         "boyut": "Boyut",
-
         "size": "Boyut",
+
+        "olcu": "Ölçü",
+        "dimension": "Ölçü",
 
         "beden": "Beden",
 
         "yuzey": "Yüzey",
-
         "surface": "Yüzey",
 
         "switch": "Switch",
@@ -3517,41 +3605,55 @@ async def browser_find_variants(
         "layout": "Layout",
 
         "dongle": "Dongle",
+
+        "kapasite": "Kapasite",
+        "capacity": "Kapasite",
     }
 
-    variants = {}
+    for index, item in enumerate(
+        data
+    ):
 
-    for item in data:
-
-        label_norm = (
-            normalize_text(
-                item.get(
-                    "label"
-                )
-            )
+        label_raw = item.get(
+            "label"
         )
 
-        value = (
-            item.get(
-                "value"
-            )
+        value = item.get(
+            "value"
+        )
+
+        label_norm = normalize_text(
+            label_raw
         )
 
         label = None
 
-        # input adı bazen
-        # product-options[Size] gibi.
-        for candidate, pretty in (
-            allowed_labels.items()
+        for key, pretty in (
+            allowed_keywords.items()
         ):
-            if candidate in (
-                label_norm
-            ):
+
+            if key in label_norm:
                 label = pretty
                 break
 
         if not label:
-            continue
+
+            # Label generic ama değer
+            # ölçüye benziyorsa yine yakala.
+            inferred = infer_variant_label(
+                label_raw,
+                value,
+                index,
+            )
+
+            if (
+                inferred.startswith(
+                    "Seçenek"
+                )
+            ):
+                continue
+
+            label = inferred
 
         pretty_value = (
             pretty_variant_value(
@@ -3563,12 +3665,14 @@ async def browser_find_variants(
         if pretty_value:
             variants[
                 label
-            ] = (
-                pretty_value
-            )
+            ] = pretty_value
 
     return variants
 
+
+# =========================================================
+# AMAZON BODY PRICE
+# =========================================================
 
 async def amazon_body_price(
     page,
@@ -3577,8 +3681,7 @@ async def amazon_body_price(
         body = (
             await page.locator(
                 "body"
-            )
-            .text_content(
+            ).text_content(
                 timeout=1800
             )
             or ""
@@ -3586,9 +3689,7 @@ async def amazon_body_price(
 
         matches = re.findall(
             r"(\d{1,3}(?:\.\d{3})*,\d{2})\s*TL",
-
             body,
-
             re.I,
         )
 
@@ -3622,12 +3723,10 @@ async def amazon_body_price(
 
         return sorted(
             counts.items(),
-
             key=lambda x: (
                 -x[1],
                 x[0],
             ),
-
         )[0][0]
 
     except Exception:
@@ -3642,19 +3741,15 @@ async def scrape_browser(
     url,
     retry=True,
 ):
-    browser = (
-        await get_browser()
-    )
+    browser = await get_browser()
 
     context = None
     page = None
 
     try:
         context = (
-            await browser
-            .new_context(
+            await browser.new_context(
                 locale="tr-TR",
-
                 timezone_id=
                     "Europe/Istanbul",
 
@@ -3664,8 +3759,8 @@ async def scrape_browser(
                     ],
 
                 viewport={
-                    "width":1365,
-                    "height":900,
+                    "width": 1365,
+                    "height": 900,
                 },
 
                 extra_http_headers={
@@ -3675,17 +3770,13 @@ async def scrape_browser(
             )
         )
 
-        page = (
-            await context
-            .new_page()
-        )
+        page = await context.new_page()
 
         async def route_handler(
             route,
         ):
             resource_type = (
-                route.request
-                .resource_type
+                route.request.resource_type
             )
 
             if resource_type in {
@@ -3710,10 +3801,8 @@ async def scrape_browser(
         try:
             await page.goto(
                 url,
-
                 wait_until=
                     "domcontentloaded",
-
                 timeout=
                     BROWSER_GOTO_TIMEOUT,
             )
@@ -3738,10 +3827,18 @@ async def scrape_browser(
             or url
         )
 
-        store = (
-            detect_store(
-                final_url
+        store = detect_store(
+            final_url
+        )
+
+        if not store:
+            store = detect_store(
+                url
             )
+
+        print(
+            "BROWSER STORE:",
+            store,
         )
 
         # =================================================
@@ -3754,11 +3851,10 @@ async def scrape_browser(
             "meyergaming.com"
             in url.lower()
         ):
-            data = (
-                await scrape_meyer(
-                    page,
-                    url,
-                )
+
+            data = await scrape_meyer(
+                page,
+                url,
             )
 
             return (
@@ -3770,14 +3866,10 @@ async def scrape_browser(
         # GENERIC
         # =================================================
 
-        html = (
-            await page.content()
-        )
+        html = await page.content()
 
-        data = (
-            extract_html_data(
-                html
-            )
+        data = extract_html_data(
+            html
         )
 
         if not data.get(
@@ -3803,13 +3895,10 @@ async def scrape_browser(
             )
 
         if (
-            store
-            == "Amazon Türkiye"
-            and
-            data.get(
+            store == "Amazon Türkiye"
+            and data.get(
                 "price"
-            )
-            is None
+            ) is None
         ):
             data["price"] = (
                 await amazon_body_price(
@@ -3826,14 +3915,10 @@ async def scrape_browser(
                 )
             )
 
-        # URL varyantlarını al.
-        variants = (
-            query_variants(
-                url
-            )
+        variants = query_variants(
+            url
         )
 
-        # DOM varyantları ile birleştir.
         try:
             dom_variants = (
                 await browser_find_variants(
@@ -3861,6 +3946,23 @@ async def scrape_browser(
             )
         )
 
+        print(
+            "BROWSER FINAL TITLE:",
+            data.get("title"),
+        )
+
+        print(
+            "BROWSER FINAL PRICE:",
+            data.get("price"),
+        )
+
+        print(
+            "BROWSER FINAL VARIANT:",
+            data.get(
+                "variant_text"
+            ),
+        )
+
         return (
             final_url,
             data,
@@ -3873,9 +3975,9 @@ async def scrape_browser(
             repr(e),
         )
 
-        message = (
-            str(e).lower()
-        )
+        message = str(
+            e
+        ).lower()
 
         browser_dead = (
             "browser has been closed"
@@ -3895,13 +3997,16 @@ async def scrape_browser(
             retry
             and browser_dead
         ):
+
+            print(
+                "BROWSER RESET + RETRY"
+            )
+
             await reset_browser()
 
-            return (
-                await scrape_browser(
-                    url,
-                    retry=False,
-                )
+            return await scrape_browser(
+                url,
+                retry=False,
             )
 
         raise
@@ -3911,20 +4016,18 @@ async def scrape_browser(
         if page is not None:
             try:
                 await page.close()
-
             except Exception:
                 pass
 
         if context is not None:
             try:
                 await context.close()
-
             except Exception:
                 pass
 
 
 # =========================================================
-# MAIN
+# ANA SCRAPER
 # =========================================================
 
 async def scrape_product(
@@ -3959,6 +4062,10 @@ async def scrape_product(
 
     if store == "Hepsiburada":
 
+        print(
+            "HEPSIBURADA -> PARSE API"
+        )
+
         return (
             await scrape_hepsiburada_api(
                 url
@@ -3967,6 +4074,8 @@ async def scrape_product(
 
     # =====================================================
     # MEYER
+    #
+    # ÇALIŞAN ÖZEL MANTIĞI KORUYORUZ.
     # =====================================================
 
     if (
@@ -3976,6 +4085,10 @@ async def scrape_product(
         in url.lower()
     ):
 
+        print(
+            "MEYER -> FAST VARIANT BROWSER"
+        )
+
         final_url, data = (
             await scrape_browser(
                 url
@@ -3983,17 +4096,12 @@ async def scrape_product(
         )
 
         title = (
-            data.get(
-                "title"
-            )
-            or
-            "Meyer Ürünü"
+            data.get("title")
+            or "Meyer Ürünü"
         )
 
-        price = (
-            data.get(
-                "price"
-            )
+        price = data.get(
+            "price"
         )
 
         if price is None:
@@ -4003,11 +4111,9 @@ async def scrape_product(
 
         return ScrapedProduct(
             title=title[:500],
-
             store="Meyer",
 
-            # Query parametreleri
-            # kaybolmasın.
+            # URL query kaybolmasın.
             url=url,
 
             price=price,
@@ -4042,31 +4148,37 @@ async def scrape_product(
         )
 
     # =====================================================
-    # WRAITH
+    # GENEL SHOPIFY
     #
-    # Önce Shopify exact variant.
+    # WRAITH / NEEKO / GELECEKTEKI SHOPIFY SITELERI
     # =====================================================
 
-    if is_wraith(
-        store,
-        url,
+    if looks_like_shopify_product_url(
+        url
     ):
+
         try:
-            return (
-                await scrape_wraith_shopify(
+            shopify_result = (
+                await scrape_shopify_product(
                     url
                 )
             )
 
+            print(
+                "GENERIC SHOPIFY SUCCESS"
+            )
+
+            return shopify_result
+
         except Exception as e:
 
             print(
-                "WRAITH SHOPIFY ERROR -> FALLBACK:",
+                "NOT SHOPIFY OR SHOPIFY FAILED -> NORMAL FLOW:",
                 repr(e),
             )
 
-            # Generic HTTP/browser'a
-            # devam et.
+            # Burada patlamıyoruz.
+            # HTTP / Chromium'a devam.
 
 
     # =====================================================
@@ -4085,23 +4197,27 @@ async def scrape_product(
         if (
             data.get(
                 "price"
-            )
-            is not None
+            ) is not None
             and
             data.get(
                 "title"
             )
         ):
-            detected = (
-                detect_store(
-                    final_url
-                )
+
+            detected = detect_store(
+                final_url
             )
 
             variants = (
                 query_variants(
                     url
                 )
+            )
+
+            print(
+                "HTTP SUCCESS:",
+                detected,
+                data["price"],
             )
 
             return ScrapedProduct(
@@ -4113,8 +4229,8 @@ async def scrape_product(
                 store=
                     detected,
 
-                # Kullanıcının variant query
-                # parametrelerini koru.
+                # Kullanıcının query'sini
+                # koruyoruz.
                 url=url,
 
                 price=
@@ -4148,6 +4264,10 @@ async def scrape_product(
                 method="http",
             )
 
+        print(
+            "HTTP DATA INCOMPLETE -> BROWSER"
+        )
+
     except Exception as e:
 
         http_error = e
@@ -4156,7 +4276,6 @@ async def scrape_product(
             "HTTP ERROR -> BROWSER:",
             repr(e),
         )
-
 
     # =====================================================
     # BROWSER FALLBACK
@@ -4170,17 +4289,12 @@ async def scrape_product(
         )
 
         title = (
-            data.get(
-                "title"
-            )
-            or
-            "Ürün"
+            data.get("title")
+            or "Ürün"
         )
 
-        price = (
-            data.get(
-                "price"
-            )
+        price = data.get(
+            "price"
         )
 
         if price is None:
@@ -4241,6 +4355,7 @@ async def scrape_product(
         )
 
         if http_error:
+
             raise RuntimeError(
                 f"HTTP başarısız "
                 f"({http_error}); "
