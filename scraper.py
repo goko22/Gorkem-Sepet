@@ -3680,13 +3680,21 @@ async def scrape_browser(
                 )
             )
 
-        if data.get("price") is None:
-            data["price"] = (
-                await browser_find_price(
-                    page,
-                    store,
-                )
-            )
+        if store == "Amazon Türkiye":
+    data["price"] = (
+        await browser_find_price(
+            page,
+            store,
+        )
+    )
+
+elif data.get("price") is None:
+    data["price"] = (
+        await browser_find_price(
+            page,
+            store,
+        )
+    )
 
         if (
             store == "Amazon Türkiye"
@@ -3967,10 +3975,11 @@ async def scrape_product(url):
         )
 
         if (
-            data.get("price")
-            is not None
-            and data.get("title")
-        ):
+    store != "Amazon Türkiye"
+    and data.get("price")
+    is not None
+    and data.get("title")
+):
             detected = detect_store(
                 final_url
             )
