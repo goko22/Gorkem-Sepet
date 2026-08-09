@@ -1,20 +1,22 @@
+import asyncio
 import json
 import os
 import re
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Optional
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, unquote
 
 import httpx
 from bs4 import BeautifulSoup
-from playwright.async_api import (
-    async_playwright,
-    TimeoutError as PlaywrightTimeoutError,
-)
+from playwright.async_api import async_playwright
 
 from utils import detect_store, parse_price
 
+
+# =========================================================
+# AYARLAR
+# =========================================================
 
 HEADERS = {
     "User-Agent": (
@@ -30,6 +32,104 @@ HEADERS = {
 }
 
 
+HTTP_TIMEOUT = httpx.Timeout(
+    connect=4.0,
+    read=6.0,
+    write=6.0,
+    pool=4.0,
+)
+
+BROWSER_GOTO_TIMEOUT = 12000
+
+
+# =========================================================
+# PLAYWRIGHT GLOBAL
+#
+# ESKI SURUM:
+# Her scrape isteğinde Chromium açılıp kapanıyordu.
+#
+# YENI SURUM:
+# Render process'i yaşadığı sürece Chromium tekrar kullanılır.
+# =========================================================
+
+_playwright_instance = None
+_browser_instance = None
+_browser_start_lock = None
+
+
+def get_browser_lock():
+    global _browser_start_lock
+
+    if _browser_start_lock is None:
+        _browser_start_lock = asyncio.Lock()
+
+    return _browser_start_lock
+
+
+async def get_browser():
+    global _playwright_instance
+    global _browser_instance
+
+    if (
+        _browser_instance is not None
+        and _browser_instance.is_connected()
+    ):
+        return _browser_instance
+
+    lock = get_browser_lock()
+
+    async with lock:
+        if (
+            _browser_instance is not None
+            and _browser_instance.is_connected()
+        ):
+            return _browser_instance
+
+        print("BROWSER STARTING...")
+
+        if _playwright_instance is None:
+            _playwright_instance = (
+                await async_playwright().start()
+            )
+
+        _browser_instance = (
+            await _playwright_instance.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-background-networking",
+                    "--disable-background-timer-throttling",
+                    "--disable-renderer-backgrounding",
+                    "--disable-component-update",
+                    "--disable-default-apps",
+                    "--no-first-run",
+                ],
+            )
+        )
+
+        print("BROWSER READY")
+
+        return _browser_instance
+
+
+async def reset_browser():
+    global _browser_instance
+
+    if _browser_instance is not None:
+        try:
+            await _browser_instance.close()
+        except Exception:
+            pass
+
+    _browser_instance = None
+
+
+# =========================================================
+# MODEL
+# =========================================================
+
 @dataclass
 class ScrapedProduct:
     title: str
@@ -43,7 +143,7 @@ class ScrapedProduct:
 
 
 # =========================================================
-# GENEL
+# TEXT
 # =========================================================
 
 def normalize_text(text):
@@ -67,99 +167,13 @@ def normalize_text(text):
         text,
     )
 
-    return re.sub(
+    text = re.sub(
         r"\s+",
         " ",
         text,
-    ).strip()
-
-
-def clean_price(value):
-    """
-    TURKISH PRICE:
-
-    4.799 TL      -> 4799.0
-    12.499 TL     -> 12499.0
-    4.799,90 TL   -> 4799.90
-    899,99 TL     -> 899.99
-    """
-
-    if value is None:
-        return None
-
-    if isinstance(value, (int, float)):
-        number = float(value)
-
-        if number > 0:
-            return number
-
-        return None
-
-    text = str(value).strip()
-
-    match = re.search(
-        r"\d[\d.,]*",
-        text,
     )
 
-    if not match:
-        return parse_price(text)
-
-    raw = match.group(0)
-
-    try:
-
-        # 4.799,90
-        if "." in raw and "," in raw:
-
-            if raw.rfind(",") > raw.rfind("."):
-                raw = (
-                    raw
-                    .replace(".", "")
-                    .replace(",", ".")
-                )
-
-            else:
-                raw = raw.replace(",", "")
-
-        # 899,99
-        elif "," in raw:
-
-            parts = raw.split(",")
-
-            if (
-                len(parts) == 2
-                and len(parts[1]) <= 2
-            ):
-                raw = raw.replace(",", ".")
-
-            else:
-                raw = raw.replace(",", "")
-
-        # 4.799
-        elif "." in raw:
-
-            parts = raw.split(".")
-
-            # 4.799 veya 12.499 veya 1.249.999
-            if (
-                len(parts) >= 2
-                and all(
-                    len(part) == 3
-                    for part in parts[1:]
-                )
-            ):
-                raw = raw.replace(".", "")
-
-        number = float(raw)
-
-        if 0 < number < 100_000_000:
-            return number
-
-    except Exception:
-        pass
-
-    return parse_price(text)
+    return text.strip()
 
 
 def similarity(a, b):
@@ -176,9 +190,136 @@ def similarity(a, b):
     ).ratio()
 
 
+# =========================================================
+# FIYAT
+# =========================================================
+
+def clean_price(value):
+    """
+    Turk fiyat formatlari:
+
+    4.799 TL       -> 4799
+    12.499 TL      -> 12499
+    1.249.999 TL   -> 1249999
+    4.799,90 TL    -> 4799.90
+    899,99 TL      -> 899.99
+
+    API formatlari:
+
+    229.00         -> 229
+    898.99         -> 898.99
+    """
+
+    if value is None:
+        return None
+
+    if isinstance(value, (int, float)):
+        number = float(value)
+
+        if 0 < number < 100_000_000:
+            return number
+
+        return None
+
+    text = str(value).strip()
+
+    if not text:
+        return None
+
+    # Sayisal kısmı bul.
+    match = re.search(
+        r"\d[\d.,]*",
+        text,
+    )
+
+    if not match:
+        try:
+            return parse_price(text)
+        except Exception:
+            return None
+
+    raw = match.group(0).strip()
+
+    try:
+        # ---------------------------------------------
+        # NOKTA + VIRGUL
+        # 4.799,90
+        # 1.249.999,50
+        # ---------------------------------------------
+
+        if "." in raw and "," in raw:
+            if raw.rfind(",") > raw.rfind("."):
+                raw = (
+                    raw
+                    .replace(".", "")
+                    .replace(",", ".")
+                )
+            else:
+                raw = raw.replace(",", "")
+
+        # ---------------------------------------------
+        # SADECE VIRGUL
+        # 899,99
+        # ---------------------------------------------
+
+        elif "," in raw:
+            parts = raw.split(",")
+
+            if (
+                len(parts) == 2
+                and len(parts[-1]) in (1, 2)
+            ):
+                raw = raw.replace(",", ".")
+            else:
+                raw = raw.replace(",", "")
+
+        # ---------------------------------------------
+        # SADECE NOKTA
+        # ---------------------------------------------
+
+        elif "." in raw:
+            parts = raw.split(".")
+
+            # Türk binlik format:
+            # 4.799
+            # 12.499
+            # 1.249.999
+            if (
+                len(parts) >= 2
+                and all(
+                    len(part) == 3
+                    for part in parts[1:]
+                )
+            ):
+                raw = raw.replace(".", "")
+
+            # API decimal:
+            # 229.00
+            # 898.99
+            else:
+                raw = raw
+
+        number = float(raw)
+
+        if 0 < number < 100_000_000:
+            return number
+
+    except Exception:
+        pass
+
+    try:
+        return parse_price(text)
+
+    except Exception:
+        return None
+
+
+# =========================================================
+# JSON-LD
+# =========================================================
+
 def walk_for_product(data):
     if isinstance(data, dict):
-
         product_type = data.get("@type")
 
         if product_type == "Product":
@@ -191,16 +332,13 @@ def walk_for_product(data):
             return data
 
         for value in data.values():
-
             result = walk_for_product(value)
 
             if result:
                 return result
 
     elif isinstance(data, list):
-
         for item in data:
-
             result = walk_for_product(item)
 
             if result:
@@ -226,8 +364,9 @@ def extract_hepsiburada_code(url):
     return None
 
 
-async def scrape_hepsiburada_api(url):
-
+async def scrape_hepsiburada_api(
+    url,
+):
     api_key = os.getenv(
         "PARSE_API_KEY"
     )
@@ -257,12 +396,12 @@ async def scrape_hepsiburada_api(url):
     }
 
     async with httpx.AsyncClient(
-        timeout=45,
+        timeout=15,
         follow_redirects=True,
     ) as client:
 
         # =================================================
-        # DETAY
+        # URUN DETAY
         # =================================================
 
         response = await client.get(
@@ -288,17 +427,16 @@ async def scrape_hepsiburada_api(url):
         )
 
         if isinstance(data, list):
-
             if not data:
                 raise RuntimeError(
-                    "Hepsiburada boş cevap verdi."
+                    "Hepsiburada API boş cevap verdi."
                 )
 
             data = data[0]
 
         if not isinstance(data, dict):
             raise RuntimeError(
-                "Hepsiburada cevabı geçersiz."
+                "Hepsiburada API cevabı geçersiz."
             )
 
         title = (
@@ -340,131 +478,151 @@ async def scrape_hepsiburada_api(url):
         # RESIM
         # =================================================
 
-        image_url = None
-
-        search_response = await client.get(
-            f"{base_url}/search_products",
-            headers=headers,
-            params={
-                "page": 1,
-                "query": title,
-            },
+        image_url = (
+            data.get("imageUrl")
+            or data.get("image_url")
+            or data.get("image")
         )
 
-        if search_response.status_code == 200:
-
+        # Details endpoint resim vermiyorsa search.
+        if not image_url:
             try:
-
-                search_payload = (
-                    search_response.json()
+                search_response = await client.get(
+                    f"{base_url}/search_products",
+                    headers=headers,
+                    params={
+                        "page": 1,
+                        "query": title,
+                    },
                 )
-
-                search_data = (
-                    search_payload.get(
-                        "data",
-                        search_payload,
-                    )
-                )
-
-                products = []
-
-                if isinstance(
-                    search_data,
-                    dict,
-                ):
-
-                    products = (
-                        search_data.get(
-                            "products",
-                            [],
-                        )
-                    )
-
-                best_item = None
-                best_score = -1
-
-                detail_product_id = str(
-                    data.get("product_id")
-                    or data.get("productId")
-                    or ""
-                ).upper()
-
-                for item in products:
-
-                    if not isinstance(
-                        item,
-                        dict,
-                    ):
-                        continue
-
-                    score = 0
-
-                    item_name = (
-                        item.get("name")
-                        or item.get("product_name")
-                        or ""
-                    )
-
-                    score += (
-                        similarity(
-                            title,
-                            item_name,
-                        )
-                        * 50
-                    )
-
-                    item_sku = str(
-                        item.get("sku")
-                        or ""
-                    ).upper()
-
-                    item_product_id = str(
-                        item.get("productId")
-                        or item.get("product_id")
-                        or ""
-                    ).upper()
-
-                    if (
-                        item_sku
-                        == product_code
-                    ):
-                        score += 100
-
-                    if (
-                        detail_product_id
-                        and item_product_id
-                        == detail_product_id
-                    ):
-                        score += 100
-
-                    item_price = clean_price(
-                        item.get("price")
-                    )
-
-                    if (
-                        item_price is not None
-                        and abs(
-                            item_price - price
-                        ) < 0.01
-                    ):
-                        score += 30
-
-                    if score > best_score:
-                        best_score = score
-                        best_item = item
-
-                if best_item:
-
-                    image_url = (
-                        best_item.get("imageUrl")
-                        or best_item.get("image_url")
-                        or best_item.get("image")
-                    )
-
-            except Exception as e:
 
                 print(
-                    "HB IMAGE ERROR:",
+                    "HEPSIBURADA SEARCH STATUS:",
+                    search_response.status_code,
+                )
+
+                if search_response.status_code == 200:
+                    search_payload = (
+                        search_response.json()
+                    )
+
+                    search_data = (
+                        search_payload.get(
+                            "data",
+                            search_payload,
+                        )
+                    )
+
+                    products = []
+
+                    if isinstance(
+                        search_data,
+                        dict,
+                    ):
+                        products = (
+                            search_data.get(
+                                "products",
+                                [],
+                            )
+                        )
+
+                    if not isinstance(
+                        products,
+                        list,
+                    ):
+                        products = []
+
+                    best_item = None
+                    best_score = -1
+
+                    detail_product_id = str(
+                        data.get("product_id")
+                        or data.get("productId")
+                        or ""
+                    ).upper()
+
+                    for item in products:
+                        if not isinstance(
+                            item,
+                            dict,
+                        ):
+                            continue
+
+                        item_name = (
+                            item.get("name")
+                            or item.get(
+                                "product_name"
+                            )
+                            or ""
+                        )
+
+                        item_sku = str(
+                            item.get("sku")
+                            or ""
+                        ).upper()
+
+                        item_product_id = str(
+                            item.get("productId")
+                            or item.get(
+                                "product_id"
+                            )
+                            or ""
+                        ).upper()
+
+                        score = (
+                            similarity(
+                                title,
+                                item_name,
+                            )
+                            * 50
+                        )
+
+                        if (
+                            item_sku
+                            == product_code
+                        ):
+                            score += 100
+
+                        if (
+                            detail_product_id
+                            and item_product_id
+                            == detail_product_id
+                        ):
+                            score += 100
+
+                        item_price = clean_price(
+                            item.get("price")
+                        )
+
+                        if (
+                            item_price is not None
+                            and abs(
+                                item_price
+                                - price
+                            ) < 0.01
+                        ):
+                            score += 30
+
+                        if score > best_score:
+                            best_score = score
+                            best_item = item
+
+                    if best_item:
+                        image_url = (
+                            best_item.get(
+                                "imageUrl"
+                            )
+                            or best_item.get(
+                                "image_url"
+                            )
+                            or best_item.get(
+                                "image"
+                            )
+                        )
+
+            except Exception as e:
+                print(
+                    "HEPSIBURADA IMAGE ERROR:",
                     repr(e),
                 )
 
@@ -491,11 +649,12 @@ async def scrape_hepsiburada_api(url):
 
 
 # =========================================================
-# HTML
+# HTML PARSER
 # =========================================================
 
-def extract_html_data(html):
-
+def extract_html_data(
+    html,
+):
     soup = BeautifulSoup(
         html,
         "html.parser",
@@ -507,11 +666,14 @@ def extract_html_data(html):
     brand = None
     model = None
 
+    # =====================================================
+    # JSON LD
+    # =====================================================
+
     for script in soup.find_all(
         "script",
         type="application/ld+json",
     ):
-
         raw = (
             script.string
             or script.get_text(
@@ -536,32 +698,53 @@ def extract_html_data(html):
             continue
 
         if not title:
-            title = product.get("name")
+            title = product.get(
+                "name"
+            )
 
-        image = product.get("image")
+        image = product.get(
+            "image"
+        )
 
         if isinstance(image, str):
-
             image_url = image
 
         elif (
             isinstance(image, list)
             and image
         ):
+            first = image[0]
 
-            image_url = image[0]
+            if isinstance(first, str):
+                image_url = first
 
-        elif isinstance(image, dict):
+            elif isinstance(first, dict):
+                image_url = (
+                    first.get("url")
+                    or first.get(
+                        "contentUrl"
+                    )
+                )
 
-            image_url = image.get("url")
+        elif isinstance(
+            image,
+            dict,
+        ):
+            image_url = (
+                image.get("url")
+                or image.get(
+                    "contentUrl"
+                )
+            )
 
-        brand_data = product.get("brand")
+        brand_data = product.get(
+            "brand"
+        )
 
         if isinstance(
             brand_data,
             dict,
         ):
-
             brand = brand_data.get(
                 "name"
             )
@@ -570,7 +753,6 @@ def extract_html_data(html):
             brand_data,
             str,
         ):
-
             brand = brand_data
 
         model = (
@@ -579,22 +761,21 @@ def extract_html_data(html):
             or product.get("mpn")
         )
 
-        offers = product.get("offers")
+        offers = product.get(
+            "offers"
+        )
 
         if isinstance(
             offers,
             dict,
         ):
-
             offers = [offers]
 
         if isinstance(
             offers,
             list,
         ):
-
             for offer in offers:
-
                 if not isinstance(
                     offer,
                     dict,
@@ -603,48 +784,89 @@ def extract_html_data(html):
 
                 candidate = clean_price(
                     offer.get("price")
-                    or offer.get("lowPrice")
-                    or offer.get("salePrice")
+                    or offer.get(
+                        "lowPrice"
+                    )
+                    or offer.get(
+                        "salePrice"
+                    )
+                    or offer.get(
+                        "sellingPrice"
+                    )
                 )
 
                 if candidate:
                     price = candidate
                     break
 
+    # =====================================================
+    # TITLE FALLBACK
+    # =====================================================
+
     if not title:
-
-        node = soup.find(
-            "meta",
-            property="og:title",
-        )
-
-        if node:
-
-            title = node.get(
-                "content"
+        for attrs in [
+            {
+                "property":
+                "og:title"
+            },
+            {
+                "name":
+                "twitter:title"
+            },
+        ]:
+            node = soup.find(
+                "meta",
+                attrs=attrs,
             )
+
+            if node:
+                value = node.get(
+                    "content"
+                )
+
+                if value:
+                    title = value.strip()
+                    break
+
+    # =====================================================
+    # IMAGE FALLBACK
+    # =====================================================
 
     if not image_url:
-
-        node = soup.find(
-            "meta",
-            property="og:image",
-        )
-
-        if node:
-
-            image_url = node.get(
-                "content"
+        for attrs in [
+            {
+                "property":
+                "og:image"
+            },
+            {
+                "name":
+                "twitter:image"
+            },
+        ]:
+            node = soup.find(
+                "meta",
+                attrs=attrs,
             )
 
-    if price is None:
+            if node:
+                value = node.get(
+                    "content"
+                )
 
+                if value:
+                    image_url = value
+                    break
+
+    # =====================================================
+    # PRICE META
+    # =====================================================
+
+    if price is None:
         for selector in [
             'meta[property="product:price:amount"]',
             'meta[property="og:price:amount"]',
             'meta[itemprop="price"]',
         ]:
-
             node = soup.select_one(
                 selector
             )
@@ -658,12 +880,10 @@ def extract_html_data(html):
             )
 
             if candidate:
-
                 price = candidate
                 break
 
     if not title and soup.title:
-
         title = soup.title.get_text(
             " ",
             strip=True,
@@ -682,15 +902,17 @@ def extract_html_data(html):
 # HTTP
 # =========================================================
 
-async def scrape_http(url):
-
+async def scrape_http(
+    url,
+):
     async with httpx.AsyncClient(
         headers=HEADERS,
         follow_redirects=True,
-        timeout=20,
+        timeout=HTTP_TIMEOUT,
     ) as client:
-
-        response = await client.get(url)
+        response = await client.get(
+            url
+        )
 
         response.raise_for_status()
 
@@ -702,45 +924,60 @@ async def scrape_http(url):
             response.text
         )
 
-        return final_url, data
+        return (
+            final_url,
+            data,
+        )
 
 
 # =========================================================
-# MEYER
+# MEYER PARAMETRE
 # =========================================================
 
-def get_meyer_variants(url):
-
-    parsed = urlparse(url)
+def get_meyer_variants(
+    url,
+):
+    parsed = urlparse(
+        url
+    )
 
     query = parse_qs(
         parsed.query
     )
 
-    def value(name):
-
-        result = query.get(
+    def get_value(name):
+        value = query.get(
             name,
             [None],
         )[0]
 
-        if result:
-            return str(result).strip()
+        if value is None:
+            return None
 
-        return None
+        return unquote(
+            str(value)
+        ).strip()
 
     return {
-        "yuzey": value("yuzey"),
-        "boyut": value("boyut"),
-        "renk": value("renk"),
+        "yuzey":
+            get_value("yuzey"),
+
+        "boyut":
+            get_value("boyut"),
+
+        "renk":
+            get_value("renk"),
     }
 
+
+# =========================================================
+# MEYER CLICK
+# =========================================================
 
 async def meyer_click_variant(
     page,
     value,
 ):
-
     if not value:
         return False
 
@@ -788,19 +1025,39 @@ async def meyer_click_variant(
         "m": [
             "m",
         ],
+
+        "s": [
+            "s",
+        ],
     }
 
-    wanted = aliases.get(
+    targets = aliases.get(
         target,
         [target],
     )
+
+    # Butonlar render olana kadar maksimum
+    # yaklaşık 2 saniye bekle.
+    try:
+        await page.wait_for_function(
+            """
+            () =>
+                document.querySelectorAll(
+                    "button"
+                ).length > 0
+            """,
+            timeout=2000,
+        )
+    except Exception:
+        pass
 
     result = await page.evaluate(
         """
         (targets) => {
 
-            function normalize(value) {
+            function norm(value) {
                 return (value || "")
+                    .toString()
                     .toLowerCase()
                     .replaceAll("ı", "i")
                     .replaceAll("ğ", "g")
@@ -812,39 +1069,48 @@ async def meyer_click_variant(
                     .trim();
             }
 
-            const normalizedTargets =
-                targets.map(normalize);
+            const wanted =
+                targets.map(norm);
 
-            const buttons =
+            const selectors = [
+                "button",
+                '[role="button"]',
+                "label"
+            ];
+
+            const nodes =
                 Array.from(
                     document.querySelectorAll(
-                        "button"
+                        selectors.join(",")
                     )
                 );
 
-            for (const button of buttons) {
+            for (const node of nodes) {
 
                 const values = [
-                    button.innerText,
-                    button.textContent,
-                    button.getAttribute(
+                    node.innerText,
+                    node.textContent,
+                    node.getAttribute(
                         "aria-label"
                     ),
-                    button.getAttribute(
+                    node.getAttribute(
                         "title"
                     ),
-                    button.getAttribute(
+                    node.getAttribute(
                         "value"
                     ),
-                    button.getAttribute(
+                    node.getAttribute(
                         "data-value"
+                    ),
+                    node.getAttribute(
+                        "data-name"
                     ),
                 ]
                 .filter(Boolean)
-                .map(normalize);
+                .map(norm);
 
-                const match =
-                    normalizedTargets.some(
+                const matched =
+                    wanted.some(
                         target =>
                             values.some(
                                 value =>
@@ -852,48 +1118,57 @@ async def meyer_click_variant(
                             )
                     );
 
-                if (!match) {
+                if (!matched) {
                     continue;
                 }
 
-                button.scrollIntoView({
+                const rect =
+                    node.getBoundingClientRect();
+
+                if (
+                    rect.width <= 0
+                    || rect.height <= 0
+                ) {
+                    continue;
+                }
+
+                node.scrollIntoView({
                     block: "center",
-                    inline: "center"
+                    inline: "center",
                 });
 
-                button.click();
+                node.click();
 
                 return {
                     success: true,
                     text:
-                        button.innerText
-                        || button.textContent
+                        node.innerText
+                        || node.textContent
                         || "",
-                    className:
-                        button.className
-                        || ""
+                    tag:
+                        node.tagName,
                 };
             }
 
             return {
-                success: false
+                success: false,
             };
         }
         """,
-        wanted,
+        targets,
     )
 
     if result.get(
         "success"
     ):
-
         print(
             "MEYER CLICKED:",
             result.get("text"),
         )
 
+        # Eski 900ms yerine kısa state beklemesi.
         await page.wait_for_timeout(
-            900
+            180
         )
 
         return True
@@ -906,417 +1181,711 @@ async def meyer_click_variant(
     return False
 
 
-async def meyer_get_title(page):
+# =========================================================
+# MEYER TITLE
+# =========================================================
+
+async def meyer_get_title(
+    page,
+    original_url,
+):
+    # =====================================================
+    # 1 - H1
+    # =====================================================
 
     try:
+        title = await page.evaluate(
+            """
+            () => {
+                const candidates =
+                    Array.from(
+                        document.querySelectorAll(
+                            "h1"
+                        )
+                    );
 
-        h1 = page.locator(
-            "h1"
-        ).first
+                for (
+                    const el
+                    of candidates
+                ) {
+                    const rect =
+                        el.getBoundingClientRect();
 
-        if await h1.count():
+                    if (
+                        rect.width > 0
+                        && rect.height > 0
+                    ) {
+                        const text =
+                            (
+                                el.innerText
+                                || el.textContent
+                                || ""
+                            ).trim();
 
-            text = (
-                await h1.inner_text(
-                    timeout=2500
-                )
-            ).strip()
+                        if (text) {
+                            return text;
+                        }
+                    }
+                }
 
-            if text:
-                return text
-
-    except Exception:
-        pass
-
-    return None
-
-
-async def meyer_get_price(page):
-
-    """
-    h1'e en yakın görünen
-    div.text-xl.font-medium içinden
-    TL fiyatını al.
-    """
-
-    title_box = None
-
-    try:
-
-        h1 = page.locator(
-            "h1"
-        ).first
-
-        if await h1.count():
-            title_box = (
-                await h1.bounding_box()
-            )
-
-    except Exception:
-        pass
-
-    candidates = []
-
-    try:
-
-        nodes = page.locator(
-            "div.text-xl.font-medium"
+                return null;
+            }
+            """
         )
 
-        count = await nodes.count()
+        if title:
+            return title.strip()
 
-        for i in range(
-            min(count, 100)
-        ):
+    except Exception:
+        pass
 
-            node = nodes.nth(i)
+    # =====================================================
+    # 2 - OG TITLE
+    # =====================================================
 
+    try:
+        title = await page.locator(
+            'meta[property="og:title"]'
+        ).get_attribute(
+            "content",
+            timeout=1000,
+        )
+
+        if title:
+            return title.strip()
+
+    except Exception:
+        pass
+
+    # =====================================================
+    # 3 - JSON LD
+    # =====================================================
+
+    try:
+        scripts = await page.locator(
+            'script[type="application/ld+json"]'
+        ).all_text_contents()
+
+        for raw in scripts:
             try:
-
-                if not await node.is_visible():
-                    continue
-
-                text = (
-                    await node.inner_text(
-                        timeout=1200
-                    )
-                ).strip()
-
-                if "TL" not in text.upper():
-                    continue
-
-                price = clean_price(text)
-
-                if price is None:
-                    continue
-
-                box = await node.bounding_box()
-
-                if not box:
-                    continue
-
-                distance = 999999
-
-                if title_box:
-
-                    tx = (
-                        title_box["x"]
-                        + title_box["width"] / 2
-                    )
-
-                    ty = (
-                        title_box["y"]
-                        + title_box["height"] / 2
-                    )
-
-                    px = (
-                        box["x"]
-                        + box["width"] / 2
-                    )
-
-                    py = (
-                        box["y"]
-                        + box["height"] / 2
-                    )
-
-                    distance = (
-                        abs(px - tx)
-                        + abs(py - ty)
-                    )
-
-                candidates.append(
-                    (
-                        distance,
-                        price,
-                        text,
-                    )
+                payload = json.loads(
+                    raw
                 )
 
             except Exception:
                 continue
 
-    except Exception as e:
+            product = walk_for_product(
+                payload
+            )
 
+            if not product:
+                continue
+
+            title = product.get(
+                "name"
+            )
+
+            if title:
+                return str(
+                    title
+                ).strip()
+
+    except Exception:
+        pass
+
+    # =====================================================
+    # 4 - DOCUMENT TITLE
+    # =====================================================
+
+    try:
+        title = await page.title()
+
+        if title:
+            cleaned = re.sub(
+                r"\s*[-|]\s*Meyer.*$",
+                "",
+                title,
+                flags=re.I,
+            ).strip()
+
+            if cleaned:
+                return cleaned
+
+    except Exception:
+        pass
+
+    # =====================================================
+    # 5 - URL SLUG
+    #
+    # Artık "ürün adı alınamadı" diye direkt patlamaz.
+    # =====================================================
+
+    try:
+        path = urlparse(
+            original_url
+        ).path.strip("/")
+
+        slug = path.split("/")[-1]
+
+        slug = unquote(
+            slug
+        )
+
+        slug = slug.replace(
+            "-",
+            " ",
+        )
+
+        slug = re.sub(
+            r"\s+",
+            " ",
+            slug,
+        ).strip()
+
+        if slug:
+            return slug.title()
+
+    except Exception:
+        pass
+
+    return "Meyer Ürünü"
+
+
+# =========================================================
+# MEYER PRICE
+# =========================================================
+
+async def meyer_get_price(
+    page,
+):
+    """
+    Meyer ana ürün fiyatını browser içinde
+    tek JS çağrısıyla toplar.
+
+    Python -> DOM için yüzlerce roundtrip yok.
+    """
+
+    try:
+        result = await page.evaluate(
+            """
+            () => {
+
+                function visible(el) {
+                    if (!el) {
+                        return false;
+                    }
+
+                    const r =
+                        el.getBoundingClientRect();
+
+                    const style =
+                        window.getComputedStyle(el);
+
+                    return (
+                        r.width > 0
+                        && r.height > 0
+                        && style.display !== "none"
+                        && style.visibility !== "hidden"
+                    );
+                }
+
+                const h1 =
+                    Array.from(
+                        document.querySelectorAll(
+                            "h1"
+                        )
+                    ).find(visible);
+
+                const titleRect =
+                    h1
+                    ? h1.getBoundingClientRect()
+                    : null;
+
+                const selectors = [
+                    "div.text-xl.font-medium",
+                    ".text-xl.font-medium",
+                    '[class*="product"] [class*="price"]',
+                    '[class*="Product"] [class*="price"]',
+                    '[class*="product"] [class*="Price"]',
+                ];
+
+                const seen =
+                    new Set();
+
+                const results = [];
+
+                for (
+                    const selector
+                    of selectors
+                ) {
+
+                    const nodes =
+                        document
+                        .querySelectorAll(
+                            selector
+                        );
+
+                    for (
+                        const el
+                        of nodes
+                    ) {
+
+                        if (
+                            seen.has(el)
+                            || !visible(el)
+                        ) {
+                            continue;
+                        }
+
+                        seen.add(el);
+
+                        const text =
+                            (
+                                el.innerText
+                                || el.textContent
+                                || ""
+                            ).trim();
+
+                        if (
+                            !/\\bTL\\b/i.test(
+                                text
+                            )
+                        ) {
+                            continue;
+                        }
+
+                        if (
+                            !/\\d/.test(
+                                text
+                            )
+                        ) {
+                            continue;
+                        }
+
+                        const r =
+                            el.getBoundingClientRect();
+
+                        let score = 0;
+
+                        if (titleRect) {
+                            const titleX =
+                                titleRect.left
+                                + titleRect.width / 2;
+
+                            const titleY =
+                                titleRect.top
+                                + titleRect.height / 2;
+
+                            const priceX =
+                                r.left
+                                + r.width / 2;
+
+                            const priceY =
+                                r.top
+                                + r.height / 2;
+
+                            const distance =
+                                Math.abs(
+                                    titleX - priceX
+                                )
+                                +
+                                Math.abs(
+                                    titleY - priceY
+                                );
+
+                            score -= distance;
+
+                            if (
+                                Math.abs(
+                                    priceY - titleY
+                                ) < 500
+                            ) {
+                                score += 1500;
+                            }
+                        }
+
+                        if (
+                            el.classList.contains(
+                                "text-xl"
+                            )
+                        ) {
+                            score += 1500;
+                        }
+
+                        if (
+                            el.classList.contains(
+                                "font-medium"
+                            )
+                        ) {
+                            score += 1000;
+                        }
+
+                        results.push({
+                            text,
+                            score,
+                        });
+                    }
+                }
+
+                results.sort(
+                    (a, b) =>
+                        b.score - a.score
+                );
+
+                return (
+                    results.length
+                    ? results[0]
+                    : null
+                );
+            }
+            """
+        )
+
+        if result:
+            text = result.get(
+                "text"
+            )
+
+            price = clean_price(
+                text
+            )
+
+            if price is not None:
+                print(
+                    "MEYER PRICE ELEMENT:",
+                    text,
+                )
+
+                return price
+
+    except Exception as e:
         print(
-            "MEYER PRICE ERROR:",
+            "MEYER PRICE DOM ERROR:",
             repr(e),
         )
 
-    if candidates:
-
-        candidates.sort(
-            key=lambda x: x[0]
-        )
-
-        print(
-            "MEYER PRICE ELEMENT:",
-            candidates[0][2],
-        )
-
-        return candidates[0][1]
-
     # =====================================================
-    # FALLBACK
+    # FALLBACK:
+    # body'nin tamamını Python ile 500 element
+    # dolaşmak yerine tek JS içinde ana h1 civarını tara.
     # =====================================================
 
     try:
+        texts = await page.evaluate(
+            """
+            () => {
 
-        nodes = page.locator(
-            "div"
+                const h1 =
+                    document.querySelector(
+                        "h1"
+                    );
+
+                let root =
+                    h1;
+
+                for (
+                    let i = 0;
+                    i < 5 && root;
+                    i++
+                ) {
+                    if (
+                        root.innerText
+                        &&
+                        /\\d[\\d.,]*\\s*TL/i
+                            .test(
+                                root.innerText
+                            )
+                    ) {
+                        break;
+                    }
+
+                    root =
+                        root.parentElement;
+                }
+
+                const source =
+                    root
+                    ? root.innerText
+                    : document.body.innerText;
+
+                const matches =
+                    source.match(
+                        /\\d[\\d.,]*\\s*TL/gi
+                    );
+
+                return matches || [];
+            }
+            """
         )
 
-        count = await nodes.count()
+        for text in texts[:15]:
+            price = clean_price(
+                text
+            )
 
-        fallback = []
-
-        for i in range(
-            min(count, 500)
-        ):
-
-            node = nodes.nth(i)
-
-            try:
-
-                if not await node.is_visible():
-                    continue
-
-                text = (
-                    await node.inner_text(
-                        timeout=300
-                    )
-                ).strip()
-
-                if not re.fullmatch(
-                    r"\d[\d.,]*\s*TL",
+            if (
+                price is not None
+                and price > 20
+            ):
+                print(
+                    "MEYER PRICE FALLBACK:",
                     text,
-                    re.I,
-                ):
-                    continue
+                )
 
-                price = clean_price(text)
-
-                box = await node.bounding_box()
-
-                if (
-                    price is not None
-                    and box
-                ):
-                    fallback.append(
-                        (
-                            box["y"],
-                            price,
-                            text,
-                        )
-                    )
-
-            except Exception:
-                continue
-
-        if fallback:
-
-            fallback.sort(
-                key=lambda x: x[0]
-            )
-
-            print(
-                "MEYER PRICE FALLBACK:",
-                fallback[0][2],
-            )
-
-            return fallback[0][1]
+                return price
 
     except Exception:
         pass
 
     return None
 
+
+# =========================================================
+# MEYER IMAGE
+# =========================================================
 
 async def meyer_get_image(
     page,
     renk=None,
 ):
-
-    """
-    Ana ürün alanındaki
-    büyük img[alt="Image"] görselini
-    seçer.
-
-    Başlığa yakınlık + boyut
-    üzerinden puanlar.
-    """
-
-    title_box = None
-
-    try:
-
-        h1 = page.locator(
-            "h1"
-        ).first
-
-        if await h1.count():
-            title_box = (
-                await h1.bounding_box()
-            )
-
-    except Exception:
-        pass
-
-    nodes = page.locator(
-        'img[alt="Image"]'
+    color = normalize_text(
+        renk
     )
 
     try:
-        count = await nodes.count()
+        result = await page.evaluate(
+            """
+            (color) => {
 
-    except Exception:
-        return None
+                function visible(el) {
+                    const r =
+                        el.getBoundingClientRect();
 
-    candidates = []
+                    const style =
+                        window.getComputedStyle(el);
 
-    normalized_color = (
-        normalize_text(renk)
-        if renk
-        else ""
-    )
+                    return (
+                        r.width > 0
+                        && r.height > 0
+                        && style.display !== "none"
+                        && style.visibility !== "hidden"
+                    );
+                }
 
-    for i in range(
-        min(count, 150)
-    ):
+                const h1 =
+                    Array.from(
+                        document.querySelectorAll(
+                            "h1"
+                        )
+                    ).find(visible);
 
-        node = nodes.nth(i)
+                const titleRect =
+                    h1
+                    ? h1.getBoundingClientRect()
+                    : null;
 
-        try:
+                const images =
+                    Array.from(
+                        document.querySelectorAll(
+                            'img[alt="Image"], img'
+                        )
+                    );
 
-            if not await node.is_visible():
-                continue
+                const results = [];
 
-            src = (
-                await node.get_attribute(
-                    "src"
-                )
+                for (
+                    const img
+                    of images
+                ) {
+
+                    if (!visible(img)) {
+                        continue;
+                    }
+
+                    const src =
+                        img.currentSrc
+                        || img.src
+                        || img.getAttribute(
+                            "data-src"
+                        )
+                        || "";
+
+                    if (!src) {
+                        continue;
+                    }
+
+                    if (
+                        !src.includes(
+                            "cdn.myikas.com"
+                        )
+                    ) {
+                        continue;
+                    }
+
+                    const r =
+                        img.getBoundingClientRect();
+
+                    const area =
+                        r.width * r.height;
+
+                    // icon vb.
+                    if (
+                        area < 20000
+                    ) {
+                        continue;
+                    }
+
+                    let score =
+                        Math.min(
+                            area / 500,
+                            1500
+                        );
+
+                    if (titleRect) {
+
+                        const imageY =
+                            r.top
+                            + r.height / 2;
+
+                        const titleY =
+                            titleRect.top
+                            + titleRect.height / 2;
+
+                        const dy =
+                            Math.abs(
+                                imageY - titleY
+                            );
+
+                        score +=
+                            Math.max(
+                                0,
+                                2000 - dy
+                            );
+
+                        // Ürün görseli çoğunlukla
+                        // başlığın solunda.
+                        if (
+                            r.left
+                            < titleRect.left
+                        ) {
+                            score += 700;
+                        }
+                    }
+
+                    const lower =
+                        src.toLowerCase();
+
+                    if (
+                        color === "siyah"
+                    ) {
+                        if (
+                            lower.includes(
+                                "-bk-"
+                            )
+                            ||
+                            lower.includes(
+                                "_bk_"
+                            )
+                            ||
+                            lower.includes(
+                                "black"
+                            )
+                            ||
+                            lower.includes(
+                                "siyah"
+                            )
+                        ) {
+                            score += 5000;
+                        }
+                    }
+
+                    if (
+                        color === "turuncu"
+                    ) {
+                        if (
+                            lower.includes(
+                                "orange"
+                            )
+                            ||
+                            lower.includes(
+                                "daidai"
+                            )
+                            ||
+                            lower.includes(
+                                "-or-"
+                            )
+                        ) {
+                            score += 5000;
+                        }
+                    }
+
+                    results.push({
+                        src,
+                        score,
+                        area,
+                    });
+                }
+
+                results.sort(
+                    (a, b) =>
+                        b.score - a.score
+                );
+
+                return (
+                    results.length
+                    ? results[0]
+                    : null
+                );
+            }
+            """,
+            color,
+        )
+
+        if result:
+            src = result.get(
+                "src"
             )
 
-            if not src:
-                continue
-
-            box = await node.bounding_box()
-
-            if not box:
-                continue
-
-            width = box.get(
-                "width",
-                0,
-            )
-
-            height = box.get(
-                "height",
-                0,
-            )
-
-            area = (
-                width * height
-            )
-
-            # Küçük thumbnail dışarı
-            if area < 40_000:
-                continue
-
-            score = 0
-
-            # Büyük görsel avantaj
-            score += min(
-                area / 1000,
-                1000,
-            )
-
-            if title_box:
-
-                image_center_y = (
-                    box["y"]
-                    + box["height"] / 2
-                )
-
-                title_center_y = (
-                    title_box["y"]
-                    + title_box["height"] / 2
-                )
-
-                vertical_distance = abs(
-                    image_center_y
-                    - title_center_y
-                )
-
-                # Başlıkla aynı ürün bölümündeyse
-                # büyük avantaj.
-                score += max(
-                    0,
-                    1000
-                    - vertical_distance
-                )
-
-            lower_src = (
-                src.lower()
-            )
-
-            # Siyah ürün görsellerinde
-            # Meyer'in dosya adında bk görüyoruz.
-            if (
-                normalized_color
-                == "siyah"
-            ):
-
-                if (
-                    "-bk-" in lower_src
-                    or "_bk_" in lower_src
-                    or "black" in lower_src
-                    or "siyah" in lower_src
-                ):
-                    score += 3000
-
-            if (
-                normalized_color
-                == "turuncu"
-            ):
-
-                if (
-                    "orange" in lower_src
-                    or "daidai" in lower_src
-                    or "-or-" in lower_src
-                ):
-                    score += 3000
-
-            candidates.append(
-                (
-                    score,
+            if src:
+                print(
+                    "MEYER IMAGE FOUND:",
                     src,
                 )
-            )
 
-        except Exception:
-            continue
+                return src
 
-    if not candidates:
+    except Exception as e:
+        print(
+            "MEYER IMAGE ERROR:",
+            repr(e),
+        )
+
+    # OG image son fallback.
+    try:
+        src = await page.locator(
+            'meta[property="og:image"]'
+        ).get_attribute(
+            "content",
+            timeout=800,
+        )
+
+        return src
+
+    except Exception:
         return None
 
-    candidates.sort(
-        key=lambda x: -x[0]
-    )
 
-    selected = candidates[0][1]
+# =========================================================
+# MEYER
+# =========================================================
 
-    print(
-        "MEYER IMAGE FOUND:",
-        selected,
-    )
-
-    return selected
-
-
-async def scrape_meyer(page, url):
-
-    variants = (
-        get_meyer_variants(url)
+async def scrape_meyer(
+    page,
+    original_url,
+):
+    variants = get_meyer_variants(
+        original_url
     )
 
     print(
@@ -1332,51 +1901,59 @@ async def scrape_meyer(page, url):
         variants,
     )
 
-    # Sayfa tamamen otursun
-    await page.wait_for_timeout(
-        1500
-    )
+    # H1 veya butonların gelmesini kısa süre bekle.
+    try:
+        await page.wait_for_function(
+            """
+            () =>
+                document.querySelector("h1")
+                ||
+                document.querySelectorAll(
+                    "button"
+                ).length > 3
+            """,
+            timeout=2500,
+        )
+    except Exception:
+        pass
 
-    # =====================================================
-    # YUZEY
-    # =====================================================
+    # URL zaten query params içeriyor.
+    # Yine de UI state'i doğru olsun diye
+    # gerekli butonları tıklıyoruz.
 
-    if variants["yuzey"]:
-
+    if variants.get(
+        "yuzey"
+    ):
         await meyer_click_variant(
             page,
             variants["yuzey"],
         )
 
-    # =====================================================
-    # BOYUT
-    # =====================================================
-
-    if variants["boyut"]:
-
+    if variants.get(
+        "boyut"
+    ):
         await meyer_click_variant(
             page,
             variants["boyut"],
         )
 
-    # =====================================================
-    # RENK
-    # =====================================================
-
-    if variants["renk"]:
-
+    if variants.get(
+        "renk"
+    ):
         await meyer_click_variant(
             page,
             variants["renk"],
         )
 
-    # JS state + resim + fiyat değişsin
+    # Eski 1.8 saniye yerine
+    # kısa React state beklemesi.
     await page.wait_for_timeout(
-        1800
+        300
     )
 
     title = await meyer_get_title(
-        page
+        page,
+        original_url,
     )
 
     price = await meyer_get_price(
@@ -1408,331 +1985,472 @@ async def scrape_meyer(page, url):
     )
 
     return {
-        "title": title,
-        "price": price,
-        "image_url": image_url,
-        "brand": None,
-        "model": None,
+        "title":
+            title,
+
+        "price":
+            price,
+
+        "image_url":
+            image_url,
+
+        "brand":
+            None,
+
+        "model":
+            None,
     }
+
+
+# =========================================================
+# BROWSER GENERIC HELPERS
+# =========================================================
+
+def get_store_price_selectors(
+    store,
+):
+    if store == "Amazon Türkiye":
+        return [
+            ".priceToPay .a-offscreen",
+            "#corePriceDisplay_desktop_feature_div .a-price .a-offscreen",
+            "#corePrice_feature_div .a-price .a-offscreen",
+            ".apexPriceToPay .a-offscreen",
+            ".a-price .a-offscreen",
+            "#priceblock_ourprice",
+            "#priceblock_dealprice",
+        ]
+
+    if store == "Trendyol":
+        return [
+            ".prc-dsc",
+            ".prc-slg",
+            '[data-testid*="price"]',
+            '[class*="price"]',
+        ]
+
+    if store == "N11":
+        return [
+            ".newPrice ins",
+            ".price",
+            '[class*="price"]',
+        ]
+
+    if store == "Wraith":
+        return [
+            '[class*="price"]',
+            '[itemprop="price"]',
+        ]
+
+    if store == "İtopya":
+        return [
+            '[class*="price"]',
+            '[itemprop="price"]',
+        ]
+
+    return [
+        '[itemprop="price"]',
+        '[class*="price"]',
+    ]
+
+
+async def browser_find_price(
+    page,
+    store,
+):
+    selectors = (
+        get_store_price_selectors(
+            store
+        )
+    )
+
+    # Tek JS çağrısıyla selectorları tara.
+    try:
+        results = await page.evaluate(
+            """
+            (selectors) => {
+
+                const output = [];
+
+                function visible(el) {
+                    const r =
+                        el.getBoundingClientRect();
+
+                    return (
+                        r.width > 0
+                        && r.height > 0
+                    );
+                }
+
+                for (
+                    let s = 0;
+                    s < selectors.length;
+                    s++
+                ) {
+
+                    const selector =
+                        selectors[s];
+
+                    let nodes = [];
+
+                    try {
+                        nodes =
+                            document
+                            .querySelectorAll(
+                                selector
+                            );
+                    }
+                    catch {
+                        continue;
+                    }
+
+                    for (
+                        let i = 0;
+                        i < Math.min(
+                            nodes.length,
+                            25
+                        );
+                        i++
+                    ) {
+                        const node =
+                            nodes[i];
+
+                        if (!visible(node)) {
+                            continue;
+                        }
+
+                        const text =
+                            (
+                                node.innerText
+                                || node.textContent
+                                || node.getAttribute(
+                                    "content"
+                                )
+                                || ""
+                            ).trim();
+
+                        if (
+                            !text
+                            || !/\\d/.test(text)
+                        ) {
+                            continue;
+                        }
+
+                        output.push({
+                            text,
+                            priority: s,
+                        });
+                    }
+                }
+
+                return output;
+            }
+            """,
+            selectors,
+        )
+
+        for item in results:
+            candidate = clean_price(
+                item.get("text")
+            )
+
+            if candidate is not None:
+                return candidate
+
+    except Exception:
+        pass
+
+    return None
+
+
+async def browser_find_title(
+    page,
+):
+    try:
+        title = await page.evaluate(
+            """
+            () => {
+                const selectors = [
+                    "#productTitle",
+                    "h1",
+                    '[data-test-id="product-name"]',
+                    '[data-testid="product-name"]'
+                ];
+
+                for (
+                    const selector
+                    of selectors
+                ) {
+                    const nodes =
+                        document
+                        .querySelectorAll(
+                            selector
+                        );
+
+                    for (
+                        const node
+                        of nodes
+                    ) {
+                        const r =
+                            node.getBoundingClientRect();
+
+                        if (
+                            r.width <= 0
+                            || r.height <= 0
+                        ) {
+                            continue;
+                        }
+
+                        const text =
+                            (
+                                node.innerText
+                                || node.textContent
+                                || ""
+                            ).trim();
+
+                        if (text) {
+                            return text;
+                        }
+                    }
+                }
+
+                const meta =
+                    document.querySelector(
+                        'meta[property="og:title"]'
+                    );
+
+                if (meta) {
+                    return (
+                        meta.content
+                        || null
+                    );
+                }
+
+                return (
+                    document.title
+                    || null
+                );
+            }
+            """
+        )
+
+        if title:
+            return title.strip()
+
+    except Exception:
+        pass
+
+    return None
+
+
+async def browser_find_image(
+    page,
+):
+    try:
+        src = await page.evaluate(
+            """
+            () => {
+
+                const selectors = [
+                    "#landingImage",
+                    'img[itemprop="image"]',
+                    'meta[property="og:image"]'
+                ];
+
+                for (
+                    const selector
+                    of selectors
+                ) {
+                    const node =
+                        document.querySelector(
+                            selector
+                        );
+
+                    if (!node) {
+                        continue;
+                    }
+
+                    if (
+                        node.tagName
+                        === "META"
+                    ) {
+                        if (node.content) {
+                            return node.content;
+                        }
+                    }
+
+                    const value =
+                        node.currentSrc
+                        || node.src
+                        || node.getAttribute(
+                            "data-src"
+                        );
+
+                    if (value) {
+                        return value;
+                    }
+                }
+
+                return null;
+            }
+            """
+        )
+
+        return src
+
+    except Exception:
+        return None
+
+
+# =========================================================
+# AMAZON BODY FALLBACK
+# =========================================================
+
+async def amazon_body_price(
+    page,
+):
+    try:
+        body = (
+            await page.locator(
+                "body"
+            ).text_content(
+                timeout=1500
+            )
+            or ""
+        )
+
+        matches = re.findall(
+            r"(\d{1,3}(?:\.\d{3})*,\d{2})\s*TL",
+            body,
+            re.I,
+        )
+
+        parsed = [
+            clean_price(x)
+            for x in matches
+        ]
+
+        parsed = [
+            x
+            for x in parsed
+            if x is not None
+        ]
+
+        if not parsed:
+            return None
+
+        counts = {}
+
+        for value in parsed:
+            counts[value] = (
+                counts.get(
+                    value,
+                    0,
+                )
+                + 1
+            )
+
+        # En sık görülen fiyat.
+        return sorted(
+            counts.items(),
+            key=lambda x: (
+                -x[1],
+                x[0],
+            ),
+        )[0][0]
+
+    except Exception:
+        return None
 
 
 # =========================================================
 # BROWSER
 # =========================================================
 
-async def scrape_browser(url):
+async def scrape_browser(
+    url,
+    retry=True,
+):
+    browser = await get_browser()
 
-    async with async_playwright() as p:
+    context = None
+    page = None
 
-        browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-            ],
-        )
-
-        context = await browser.new_context(
-            locale="tr-TR",
-            timezone_id="Europe/Istanbul",
-            user_agent=HEADERS[
-                "User-Agent"
-            ],
-            viewport={
-                "width": 1440,
-                "height": 1200,
-            },
-            extra_http_headers={
-                "Accept-Language":
-                "tr-TR,tr;q=0.9,en;q=0.8"
-            },
+    try:
+        context = (
+            await browser.new_context(
+                locale="tr-TR",
+                timezone_id=(
+                    "Europe/Istanbul"
+                ),
+                user_agent=(
+                    HEADERS[
+                        "User-Agent"
+                    ]
+                ),
+                viewport={
+                    "width": 1365,
+                    "height": 900,
+                },
+                extra_http_headers={
+                    "Accept-Language":
+                        "tr-TR,tr;q=0.9,en;q=0.8"
+                },
+            )
         )
 
         page = await context.new_page()
 
-        try:
+        # Font / media indirmeye gerek yok.
+        async def route_handler(
+            route,
+        ):
+            request = route.request
 
-            await page.goto(
-                url,
-                wait_until="domcontentloaded",
-                timeout=45000,
-            )
-
-            try:
-
-                await page.wait_for_load_state(
-                    "networkidle",
-                    timeout=10000,
-                )
-
-            except PlaywrightTimeoutError:
-
-                await page.wait_for_timeout(
-                    2500
-                )
-
-            final_url = page.url
-
-            store = detect_store(
-                final_url
-            )
-
-            # =================================================
-            # MEYER
-            # =================================================
-
-            if store == "Meyer":
-
-                data = await scrape_meyer(
-                    page,
-                    url,
-                )
-
-                return (
-                    final_url,
-                    data,
-                )
-
-            # =================================================
-            # DIGER SITELER
-            # =================================================
-
-            html = await page.content()
-
-            data = extract_html_data(
-                html
-            )
-
-            if store == "Amazon Türkiye":
-
-                selectors = [
-                    ".priceToPay .a-offscreen",
-                    "#corePriceDisplay_desktop_feature_div .a-price .a-offscreen",
-                    "#corePrice_feature_div .a-price .a-offscreen",
-                    ".apexPriceToPay .a-offscreen",
-                    ".a-price .a-offscreen",
-                    "#priceblock_ourprice",
-                    "#priceblock_dealprice",
-                ]
-
-            elif store == "Trendyol":
-
-                selectors = [
-                    ".prc-dsc",
-                    ".prc-slg",
-                    '[class*="price"]',
-                ]
-
-            elif store == "N11":
-
-                selectors = [
-                    ".newPrice ins",
-                    ".price",
-                    '[class*="price"]',
-                ]
+            if request.resource_type in {
+                "font",
+                "media",
+            }:
+                await route.abort()
 
             else:
+                await route.continue_()
 
-                selectors = [
-                    '[itemprop="price"]',
-                    '[class*="price"]',
-                ]
+        await page.route(
+            "**/*",
+            route_handler,
+        )
 
-            if data["price"] is None:
+        print(
+            "BROWSER GOTO:",
+            url,
+        )
 
-                for selector in selectors:
+        # NETWORKIDLE YOK.
+        await page.goto(
+            url,
+            wait_until="domcontentloaded",
+            timeout=BROWSER_GOTO_TIMEOUT,
+        )
 
-                    try:
+        final_url = page.url
 
-                        locator = page.locator(
-                            selector
-                        )
+        store = detect_store(
+            final_url
+        )
 
-                        count = (
-                            await locator.count()
-                        )
+        print(
+            "BROWSER STORE:",
+            store,
+        )
 
-                        for i in range(
-                            min(count, 20)
-                        ):
+        # =================================================
+        # MEYER
+        # =================================================
 
-                            text = (
-                                await locator
-                                .nth(i)
-                                .text_content(
-                                    timeout=1200
-                                )
-                                or ""
-                            )
-
-                            candidate = (
-                                clean_price(
-                                    text
-                                )
-                            )
-
-                            if candidate:
-
-                                data[
-                                    "price"
-                                ] = candidate
-
-                                break
-
-                        if data[
-                            "price"
-                        ]:
-                            break
-
-                    except Exception:
-                        pass
-
-            # =================================================
-            # AMAZON FALLBACK
-            # =================================================
-
-            if (
-                store == "Amazon Türkiye"
-                and data["price"] is None
-            ):
-
-                try:
-
-                    body = (
-                        await page.locator(
-                            "body"
-                        ).text_content(
-                            timeout=5000
-                        )
-                        or ""
-                    )
-
-                    tl_prices = re.findall(
-                        r"(\d{1,3}(?:\.\d{3})*,\d{2})\s*TL",
-                        body,
-                        re.I,
-                    )
-
-                    parsed = [
-                        clean_price(x)
-                        for x in tl_prices
-                    ]
-
-                    parsed = [
-                        x
-                        for x in parsed
-                        if x is not None
-                    ]
-
-                    if parsed:
-
-                        counts = {}
-
-                        for value in parsed:
-
-                            counts[value] = (
-                                counts.get(
-                                    value,
-                                    0,
-                                )
-                                + 1
-                            )
-
-                        data["price"] = (
-                            sorted(
-                                counts.items(),
-                                key=lambda x: (
-                                    -x[1],
-                                    x[0],
-                                ),
-                            )[0][0]
-                        )
-
-                except Exception:
-                    pass
-
-            if not data["title"]:
-
-                for selector in [
-                    "#productTitle",
-                    "h1",
-                    '[data-test-id="product-name"]',
-                ]:
-
-                    try:
-
-                        node = (
-                            page.locator(
-                                selector
-                            ).first
-                        )
-
-                        if await node.count():
-
-                            text = (
-                                await node
-                                .text_content(
-                                    timeout=1200
-                                )
-                                or ""
-                            ).strip()
-
-                            if text:
-
-                                data[
-                                    "title"
-                                ] = text
-
-                                break
-
-                    except Exception:
-                        pass
-
-            if not data[
-                "image_url"
-            ]:
-
-                for selector in [
-                    "#landingImage",
-                    'img[itemprop="image"]',
-                ]:
-
-                    try:
-
-                        node = (
-                            page.locator(
-                                selector
-                            ).first
-                        )
-
-                        if await node.count():
-
-                            src = (
-                                await node
-                                .get_attribute(
-                                    "src"
-                                )
-                            )
-
-                            if src:
-
-                                data[
-                                    "image_url"
-                                ] = src
-
-                                break
-
-                    except Exception:
-                        pass
-
-            print(
-                "BROWSER STORE:",
-                store,
-            )
-
-            print(
-                "BROWSER PRICE:",
-                data["price"],
+        if store == "Meyer":
+            data = await scrape_meyer(
+                page,
+                url,
             )
 
             return (
@@ -1740,184 +2458,371 @@ async def scrape_browser(url):
                 data,
             )
 
-        finally:
+        # =================================================
+        # SAYFADAN İLK DATA
+        # =================================================
 
-            await context.close()
-            await browser.close()
+        html = await page.content()
+
+        data = extract_html_data(
+            html
+        )
+
+        # =================================================
+        # TITLE
+        # =================================================
+
+        if not data.get(
+            "title"
+        ):
+            data["title"] = (
+                await browser_find_title(
+                    page
+                )
+            )
+
+        # =================================================
+        # PRICE
+        # =================================================
+
+        if data.get(
+            "price"
+        ) is None:
+            data["price"] = (
+                await browser_find_price(
+                    page,
+                    store,
+                )
+            )
+
+        # Amazon özel fallback.
+        if (
+            store == "Amazon Türkiye"
+            and data.get(
+                "price"
+            ) is None
+        ):
+            data["price"] = (
+                await amazon_body_price(
+                    page
+                )
+            )
+
+        # =================================================
+        # IMAGE
+        # =================================================
+
+        if not data.get(
+            "image_url"
+        ):
+            data["image_url"] = (
+                await browser_find_image(
+                    page
+                )
+            )
+
+        print(
+            "BROWSER FINAL TITLE:",
+            data.get("title"),
+        )
+
+        print(
+            "BROWSER FINAL PRICE:",
+            data.get("price"),
+        )
+
+        return (
+            final_url,
+            data,
+        )
+
+    except Exception as e:
+        print(
+            "BROWSER ERROR:",
+            repr(e),
+        )
+
+        # Browser process çöktüyse bir kere restart.
+        message = str(
+            e
+        ).lower()
+
+        browser_dead = (
+            "browser has been closed"
+            in message
+            or "target page"
+            in message
+            or "browser closed"
+            in message
+            or "connection closed"
+            in message
+        )
+
+        if (
+            retry
+            and browser_dead
+        ):
+            print(
+                "BROWSER RESET + RETRY"
+            )
+
+            await reset_browser()
+
+            return await scrape_browser(
+                url,
+                retry=False,
+            )
+
+        raise
+
+    finally:
+        if page is not None:
+            try:
+                await page.close()
+            except Exception:
+                pass
+
+        if context is not None:
+            try:
+                await context.close()
+            except Exception:
+                pass
 
 
 # =========================================================
-# ANA
+# ANA SCRAPER
 # =========================================================
 
-async def scrape_product(url):
-
+async def scrape_product(
+    url,
+):
     if not url.startswith(
         (
             "http://",
             "https://",
         )
     ):
-
         raise ValueError(
             "Geçerli bir ürün linki gir."
         )
 
-    store = detect_store(url)
+    store = detect_store(
+        url
+    )
+
+    print(
+        "================================="
+    )
+
+    print(
+        "SCRAPE START:",
+        store,
+    )
 
     # =====================================================
     # HEPSIBURADA
     # =====================================================
 
     if store == "Hepsiburada":
-
         print(
             "HEPSIBURADA -> PARSE API"
         )
 
-        return await scrape_hepsiburada_api(
-            url
+        return (
+            await scrape_hepsiburada_api(
+                url
+            )
         )
 
     # =====================================================
     # MEYER
+    #
+    # Variant nedeniyle direkt browser.
+    # HTTP'ye gidip boşuna 6 saniye harcamıyoruz.
     # =====================================================
 
     if store == "Meyer":
-
         print(
-            "MEYER -> DOM VARIANT BROWSER"
+            "MEYER -> FAST VARIANT BROWSER"
         )
 
         final_url, data = (
-            await scrape_browser(url)
+            await scrape_browser(
+                url
+            )
         )
 
-        if not data.get("title"):
+        title = (
+            data.get("title")
+            or "Meyer Ürünü"
+        )
 
+        price = data.get(
+            "price"
+        )
+
+        if price is None:
             raise RuntimeError(
-                "Meyer ürün adı alınamadı."
-            )
-
-        if data.get("price") is None:
-
-            raise RuntimeError(
-                "Meyer varyant fiyatı alınamadı."
+                "Meyer ürün fiyatı alınamadı."
             )
 
         return ScrapedProduct(
-            title=data["title"][:500],
+            title=title[:500],
             store="Meyer",
             url=url,
-            price=data["price"],
+            price=price,
             image_url=data.get(
                 "image_url"
             ),
-            brand=data.get("brand"),
-            model=data.get("model"),
-            method="meyer-dom-variant",
+            brand=data.get(
+                "brand"
+            ),
+            model=data.get(
+                "model"
+            ),
+            method=(
+                "meyer-fast-browser"
+            ),
         )
 
     # =====================================================
-    # DIGER SITELER - HTTP
+    # DIGER MAGAZALAR
+    #
+    # Önce hızlı HTTP.
+    # En fazla yaklaşık 6 saniye.
     # =====================================================
 
     http_error = None
 
     try:
-
         final_url, data = (
-            await scrape_http(url)
+            await scrape_http(
+                url
+            )
         )
 
         if (
-            data["price"] is not None
-            and data["title"]
+            data.get("price")
+            is not None
+            and data.get("title")
         ):
+            detected = detect_store(
+                final_url
+            )
 
             print(
                 "HTTP SUCCESS:",
-                detect_store(
-                    final_url
-                ),
+                detected,
                 data["price"],
             )
 
             return ScrapedProduct(
-                title=data[
-                    "title"
-                ][:500],
-                store=detect_store(
-                    final_url
+                title=(
+                    data["title"][:500]
                 ),
+
+                store=detected,
+
                 url=final_url,
-                price=data["price"],
-                image_url=data[
-                    "image_url"
+
+                price=data[
+                    "price"
                 ],
-                brand=data["brand"],
-                model=data["model"],
+
+                image_url=data.get(
+                    "image_url"
+                ),
+
+                brand=data.get(
+                    "brand"
+                ),
+
+                model=data.get(
+                    "model"
+                ),
+
                 method="http",
             )
 
-    except Exception as e:
+        print(
+            "HTTP DATA INCOMPLETE -> BROWSER"
+        )
 
+    except Exception as e:
         http_error = e
 
         print(
-            "HTTP ERROR:",
+            "HTTP ERROR -> BROWSER:",
             repr(e),
         )
 
     # =====================================================
-    # DIGER SITELER - BROWSER
+    # BROWSER FALLBACK
     # =====================================================
 
     try:
-
         final_url, data = (
-            await scrape_browser(url)
+            await scrape_browser(
+                url
+            )
         )
 
-        if not data["title"]:
+        title = (
+            data.get("title")
+            or "Ürün"
+        )
 
-            data["title"] = "Ürün"
+        price = data.get(
+            "price"
+        )
 
-        if data["price"] is None:
-
+        if price is None:
             raise RuntimeError(
                 "Sayfa açıldı fakat fiyat bulunamadı."
             )
 
         return ScrapedProduct(
-            title=data["title"][:500],
+            title=title[:500],
+
             store=detect_store(
                 final_url
             ),
+
             url=final_url,
-            price=data["price"],
-            image_url=data[
+
+            price=price,
+
+            image_url=data.get(
                 "image_url"
-            ],
-            brand=data["brand"],
-            model=data["model"],
+            ),
+
+            brand=data.get(
+                "brand"
+            ),
+
+            model=data.get(
+                "model"
+            ),
+
             method="browser",
         )
 
     except Exception as browser_error:
-
         print(
-            "BROWSER ERROR:",
-            repr(browser_error),
+            "FINAL BROWSER ERROR:",
+            repr(
+                browser_error
+            ),
         )
 
         if http_error:
-
             raise RuntimeError(
                 f"HTTP başarısız ({http_error}); "
-                f"Chromium da başarısız ({browser_error})"
+                f"tarayıcı da başarısız "
+                f"({browser_error})"
             )
 
         raise RuntimeError(
-            f"Chromium başarısız ({browser_error})"
+            f"Tarayıcı başarısız "
+            f"({browser_error})"
         )
