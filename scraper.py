@@ -1,8 +1,9 @@
-import asyncio
 import json
+import os
 import re
 from dataclasses import dataclass
 from typing import Optional
+from urllib.parse import quote
 
 import httpx
 from bs4 import BeautifulSoup
@@ -21,10 +22,6 @@ HEADERS = {
         "Chrome/124.0.0.0 Safari/537.36"
     ),
     "Accept-Language": "tr-TR,tr;q=0.9,en;q=0.8",
-    "Accept": (
-        "text/html,application/xhtml+xml,"
-        "application/xml;q=0.9,*/*;q=0.8"
-    ),
 }
 
 
@@ -41,94 +38,42 @@ class ScrapedProduct:
 
 
 # =========================================================
-# URUN KODU
+# GENEL YARDIMCILAR
 # =========================================================
 
-def extract_product_code(url: str):
-
-    # Hepsiburada
-    match = re.search(
-        r"(HBCV[A-Z0-9]+)",
-        url,
-        re.I,
-    )
-
-    if match:
-        return match.group(1).upper()
-
-    # Amazon ASIN
-    match = re.search(
-        r"/(?:dp|gp/product)/([A-Z0-9]{10})",
-        url,
-        re.I,
-    )
-
-    if match:
-        return match.group(1).upper()
-
-    return None
-
-
-# =========================================================
-# FIYAT PARSER
-# =========================================================
-
-def clean_price(text):
-    """
-    898,99 TL
-    1.299,90 TL
-    1299.90
-    gibi degerleri float'a cevirir.
-    """
-
-    if text is None:
+def clean_price(value):
+    if value is None:
         return None
 
-    text = str(text)
+    if isinstance(value, (int, float)):
+        value = float(value)
+        return value if value > 0 else None
+
+    text = str(value).strip()
 
     patterns = [
-        r"(\d{1,3}(?:\.\d{3})+,\d{2})",
-        r"(\d+,\d{2})",
-        r"(\d{1,3}(?:\.\d{3})+)",
-        r"(\d+\.\d{2})",
+        r"(\d{1,3}(?:\.\d{3})+,\d{1,2})",
+        r"(\d+,\d{1,2})",
+        r"(\d+\.\d{1,2})",
+        r"(\d+)",
     ]
 
     for pattern in patterns:
-
-        match = re.search(
-            pattern,
-            text,
-        )
+        match = re.search(pattern, text)
 
         if not match:
             continue
 
-        value = match.group(1)
+        raw = match.group(1)
 
         try:
+            if "," in raw:
+                raw = raw.replace(".", "").replace(",", ".")
 
-            if "," in value:
+            value = float(raw)
 
-                value = (
-                    value
-                    .replace(".", "")
-                    .replace(",", ".")
-                )
-
-            elif value.count(".") > 1:
-
-                value = value.replace(
-                    ".",
-                    "",
-                )
-
-            result = float(value)
-
-            if (
-                result > 0
-                and result < 100_000_000
-            ):
-                return result
+            if 0 < value < 100_000_000:
+                return value
 
         except Exception:
             pass
@@ -136,83 +81,25 @@ def clean_price(text):
     return parse_price(text)
 
 
-# =========================================================
-# BODY ICINDEN TL FIYATI BUL
-# =========================================================
-
-def find_tl_prices(text: str):
-
-    if not text:
-        return []
-
-    patterns = [
-        r"(\d{1,3}(?:\.\d{3})*,\d{2})\s*TL",
-        r"(\d{1,3}(?:\.\d{3})*,\d{2})\s*₺",
-        r"₺\s*(\d{1,3}(?:\.\d{3})*,\d{2})",
-    ]
-
-    prices = []
-
-    for pattern in patterns:
-
-        for match in re.findall(
-            pattern,
-            text,
-            re.I,
-        ):
-
-            price = clean_price(match)
-
-            if (
-                price is not None
-                and price >= 1
-                and price <= 50_000_000
-            ):
-                prices.append(price)
-
-    return prices
-
-
-# =========================================================
-# JSON-LD
-# =========================================================
-
 def walk_for_product(data):
-
     if isinstance(data, dict):
-
-        product_type = data.get(
-            "@type"
-        )
+        product_type = data.get("@type")
 
         if product_type == "Product":
             return data
 
-        if (
-            isinstance(
-                product_type,
-                list,
-            )
-            and "Product" in product_type
-        ):
+        if isinstance(product_type, list) and "Product" in product_type:
             return data
 
         for value in data.values():
-
-            result = walk_for_product(
-                value
-            )
+            result = walk_for_product(value)
 
             if result:
                 return result
 
     elif isinstance(data, list):
-
         for item in data:
-
-            result = walk_for_product(
-                item
-            )
+            result = walk_for_product(item)
 
             if result:
                 return result
@@ -220,65 +107,159 @@ def walk_for_product(data):
     return None
 
 
-def product_json_price(product):
+# =========================================================
+# HEPSIBURADA - PARSE.BOT
+# =========================================================
 
-    if not isinstance(
-        product,
-        dict,
-    ):
-        return None
+async def scrape_hepsiburada_api(url: str) -> ScrapedProduct:
+    api_key = os.getenv("PARSE_API_KEY")
 
-    offers = product.get(
-        "offers"
+    if not api_key:
+        raise RuntimeError(
+            "PARSE_API_KEY Render Environment Variables içinde tanımlı değil."
+        )
+
+    endpoint = (
+        "https://api.parse.bot/scraper/"
+        "a42a78b8-347f-4c69-8e83-135320d2b001/"
+        "get_product_details"
     )
 
-    if isinstance(
-        offers,
-        dict,
-    ):
-        offers = [offers]
+    headers = {
+        "X-API-Key": api_key,
+        "Accept": "application/json",
+    }
 
-    if not isinstance(
-        offers,
-        list,
-    ):
-        return None
+    params = {
+        "product": url
+    }
 
-    for offer in offers:
+    async with httpx.AsyncClient(
+        timeout=40,
+        follow_redirects=True,
+    ) as client:
 
-        if not isinstance(
-            offer,
-            dict,
-        ):
-            continue
+        response = await client.get(
+            endpoint,
+            headers=headers,
+            params=params,
+        )
 
-        for key in [
-            "price",
-            "lowPrice",
-            "salePrice",
-            "sellingPrice",
-            "currentPrice",
-        ]:
+        print(
+            "PARSE HB STATUS:",
+            response.status_code,
+        )
 
-            value = clean_price(
-                offer.get(key)
+        if response.status_code >= 400:
+            print(
+                "PARSE HB BODY:",
+                response.text[:2000],
             )
 
-            if value is not None:
-                return value
+        response.raise_for_status()
 
-    return None
+        payload = response.json()
+
+    print(
+        "PARSE HB RESPONSE:",
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+        )[:4000],
+    )
+
+    # Parse response genelde:
+    # {
+    #   "status": "success",
+    #   "data": {...}
+    # }
+
+    data = payload.get("data", payload)
+
+    if isinstance(data, list):
+        if not data:
+            raise RuntimeError(
+                "Hepsiburada API boş sonuç döndürdü."
+            )
+        data = data[0]
+
+    if not isinstance(data, dict):
+        raise RuntimeError(
+            "Hepsiburada API beklenmeyen cevap döndürdü."
+        )
+
+    title = (
+        data.get("product_name")
+        or data.get("name")
+        or data.get("title")
+    )
+
+    price = clean_price(
+        data.get("unit_price")
+        or data.get("price")
+        or data.get("priceText")
+    )
+
+    image_url = (
+        data.get("imageUrl")
+        or data.get("image_url")
+        or data.get("image")
+    )
+
+    # Bazı API cevaplarında images listesi olabilir.
+    if not image_url:
+        images = data.get("images")
+
+        if isinstance(images, list) and images:
+            first = images[0]
+
+            if isinstance(first, str):
+                image_url = first
+
+            elif isinstance(first, dict):
+                image_url = (
+                    first.get("url")
+                    or first.get("imageUrl")
+                )
+
+    brand = (
+        data.get("brand")
+        or data.get("brand_name")
+    )
+
+    model = (
+        data.get("sku")
+        or data.get("productId")
+        or data.get("product_id")
+    )
+
+    if not title:
+        raise RuntimeError(
+            "Hepsiburada API ürün adını döndürmedi."
+        )
+
+    if price is None:
+        raise RuntimeError(
+            "Hepsiburada API ürün fiyatını döndürmedi."
+        )
+
+    return ScrapedProduct(
+        title=title[:500],
+        store="Hepsiburada",
+        url=url,
+        price=price,
+        image_url=image_url,
+        brand=brand,
+        model=model,
+        method="parse-api",
+    )
 
 
 # =========================================================
-# HTML PARSER
+# NORMAL HTML PARSER
 # =========================================================
 
-def extract_html_data(
-    html,
-    url,
-):
-
+def extract_html_data(html: str):
     soup = BeautifulSoup(
         html,
         "html.parser",
@@ -290,215 +271,116 @@ def extract_html_data(
     brand = None
     model = None
 
-    # -----------------------------------------------------
     # JSON-LD
-    # -----------------------------------------------------
-
     for script in soup.find_all(
         "script",
         type="application/ld+json",
     ):
-
         raw = (
             script.string
-            or script.get_text(
-                strip=True
-            )
+            or script.get_text(strip=True)
         )
 
         if not raw:
             continue
 
         try:
-
-            payload = json.loads(
-                raw
-            )
-
+            payload = json.loads(raw)
         except Exception:
             continue
 
-        product = walk_for_product(
-            payload
-        )
+        product = walk_for_product(payload)
 
         if not product:
             continue
 
-        if not title:
+        title = product.get("name") or title
 
-            title = product.get(
-                "name"
-            )
+        image = product.get("image")
 
-        if price is None:
-
-            price = product_json_price(
-                product
-            )
-
-        image = product.get(
-            "image"
-        )
-
-        if isinstance(
-            image,
-            str,
-        ):
-
+        if isinstance(image, str):
             image_url = image
 
-        elif (
-            isinstance(
-                image,
-                list,
-            )
-            and image
-        ):
-
+        elif isinstance(image, list) and image:
             image_url = image[0]
 
-        elif isinstance(
-            image,
-            dict,
-        ):
+        elif isinstance(image, dict):
+            image_url = image.get("url")
 
-            image_url = image.get(
-                "url"
-            )
+        brand_data = product.get("brand")
 
-        brand_data = product.get(
-            "brand"
-        )
+        if isinstance(brand_data, dict):
+            brand = brand_data.get("name")
 
-        if isinstance(
-            brand_data,
-            dict,
-        ):
-
-            brand = brand_data.get(
-                "name"
-            )
-
-        elif isinstance(
-            brand_data,
-            str,
-        ):
-
+        elif isinstance(brand_data, str):
             brand = brand_data
 
         model = (
             product.get("model")
-            or product.get("mpn")
             or product.get("sku")
+            or product.get("mpn")
         )
 
-    # -----------------------------------------------------
-    # TITLE
-    # -----------------------------------------------------
+        offers = product.get("offers")
 
+        if isinstance(offers, dict):
+            offers = [offers]
+
+        if isinstance(offers, list):
+            for offer in offers:
+                if not isinstance(offer, dict):
+                    continue
+
+                price = clean_price(
+                    offer.get("price")
+                    or offer.get("lowPrice")
+                    or offer.get("salePrice")
+                )
+
+                if price:
+                    break
+
+    # OpenGraph
     if not title:
-
         node = soup.find(
             "meta",
             property="og:title",
         )
 
         if node:
-
-            title = node.get(
-                "content"
-            )
-
-    # -----------------------------------------------------
-    # IMAGE
-    # -----------------------------------------------------
+            title = node.get("content")
 
     if not image_url:
-
         node = soup.find(
             "meta",
             property="og:image",
         )
 
         if node:
+            image_url = node.get("content")
 
-            image_url = node.get(
-                "content"
-            )
-
-    # -----------------------------------------------------
-    # META PRICE
-    # -----------------------------------------------------
-
+    # Meta price
     if price is None:
-
-        selectors = [
+        for selector in [
             'meta[property="product:price:amount"]',
             'meta[property="og:price:amount"]',
             'meta[itemprop="price"]',
-        ]
+        ]:
 
-        for selector in selectors:
-
-            node = soup.select_one(
-                selector
-            )
+            node = soup.select_one(selector)
 
             if not node:
                 continue
 
-            candidate = clean_price(
+            price = clean_price(
                 node.get("content")
                 or node.get("value")
             )
-
-            if candidate:
-
-                price = candidate
-                break
-
-    # -----------------------------------------------------
-    # AMAZON HTML OZEL
-    # -----------------------------------------------------
-
-    if price is None:
-
-        amazon_selectors = [
-            ".priceToPay .a-offscreen",
-            "#corePriceDisplay_desktop_feature_div .a-offscreen",
-            "#corePrice_feature_div .a-offscreen",
-            ".apexPriceToPay .a-offscreen",
-            ".a-price .a-offscreen",
-            "#priceblock_ourprice",
-            "#priceblock_dealprice",
-        ]
-
-        for selector in amazon_selectors:
-
-            nodes = soup.select(
-                selector
-            )
-
-            for node in nodes[:20]:
-
-                candidate = clean_price(
-                    node.get_text(
-                        " ",
-                        strip=True,
-                    )
-                )
-
-                if candidate:
-
-                    price = candidate
-                    break
 
             if price:
                 break
 
     if not title and soup.title:
-
         title = soup.title.get_text(
             " ",
             strip=True,
@@ -517,41 +399,31 @@ def extract_html_data(
 # NORMAL HTTP
 # =========================================================
 
-async def scrape_http(url):
-
+async def scrape_http(url: str):
     async with httpx.AsyncClient(
         headers=HEADERS,
         follow_redirects=True,
         timeout=20,
     ) as client:
 
-        response = await client.get(
-            url
-        )
+        response = await client.get(url)
 
         response.raise_for_status()
 
-        final_url = str(
-            response.url
-        )
+        final_url = str(response.url)
 
         data = extract_html_data(
-            response.text,
-            final_url,
+            response.text
         )
 
-        return (
-            final_url,
-            data,
-        )
+        return final_url, data
 
 
 # =========================================================
-# PLAYWRIGHT
+# CHROMIUM
 # =========================================================
 
-async def scrape_browser(url):
-
+async def scrape_browser(url: str):
     async with async_playwright() as p:
 
         browser = await p.chromium.launch(
@@ -565,23 +437,16 @@ async def scrape_browser(url):
         context = await browser.new_context(
             locale="tr-TR",
             timezone_id="Europe/Istanbul",
-            user_agent=HEADERS[
-                "User-Agent"
-            ],
+            user_agent=HEADERS["User-Agent"],
             viewport={
                 "width": 1440,
                 "height": 1200,
-            },
-            extra_http_headers={
-                "Accept-Language":
-                "tr-TR,tr;q=0.9,en;q=0.8"
             },
         )
 
         page = await context.new_page()
 
         try:
-
             await page.goto(
                 url,
                 wait_until="domcontentloaded",
@@ -589,16 +454,14 @@ async def scrape_browser(url):
             )
 
             try:
-
                 await page.wait_for_load_state(
                     "networkidle",
-                    timeout=12000,
+                    timeout=10000,
                 )
 
             except PlaywrightTimeoutError:
-
                 await page.wait_for_timeout(
-                    4000
+                    3000
                 )
 
             final_url = page.url
@@ -610,59 +473,13 @@ async def scrape_browser(url):
             html = await page.content()
 
             data = extract_html_data(
-                html,
-                final_url,
+                html
             )
 
-            # -------------------------------------------------
-            # BODY TEXT
-            # -------------------------------------------------
-
-            try:
-
-                body_text = (
-                    await page.locator(
-                        "body"
-                    ).text_content(
-                        timeout=5000
-                    )
-                    or ""
-                )
-
-            except Exception:
-
-                body_text = ""
-
-            print(
-                "=" * 70
-            )
-
-            print(
-                "STORE:",
-                store
-            )
-
-            print(
-                "PAGE TITLE:",
-                await page.title()
-            )
-
-            print(
-                "HTML LENGTH:",
-                len(html)
-            )
-
-            # =================================================
-            # AMAZON
-            # =================================================
-
+            # Amazon
             if store == "Amazon Türkiye":
 
-                print(
-                    "AMAZON MODE"
-                )
-
-                amazon_selectors = [
+                selectors = [
                     ".priceToPay .a-offscreen",
                     "#corePriceDisplay_desktop_feature_div .a-price .a-offscreen",
                     "#corePrice_feature_div .a-price .a-offscreen",
@@ -672,177 +489,44 @@ async def scrape_browser(url):
                     "#priceblock_dealprice",
                 ]
 
-                for selector in (
-                    amazon_selectors
-                ):
+            # Trendyol
+            elif store == "Trendyol":
 
-                    try:
-
-                        locator = (
-                            page.locator(
-                                selector
-                            )
-                        )
-
-                        count = (
-                            await locator.count()
-                        )
-
-                        print(
-                            "SELECTOR:",
-                            selector,
-                            "COUNT:",
-                            count,
-                        )
-
-                        for i in range(
-                            min(
-                                count,
-                                15,
-                            )
-                        ):
-
-                            node = (
-                                locator.nth(i)
-                            )
-
-                            # BURASI ONEMLI:
-                            # inner_text degil
-                            # text_content kullaniyoruz.
-
-                            text = (
-                                await node.text_content(
-                                    timeout=1500
-                                )
-                                or ""
-                            )
-
-                            print(
-                                "PRICE TEXT:",
-                                repr(text),
-                            )
-
-                            candidate = clean_price(
-                                text
-                            )
-
-                            if candidate:
-
-                                data["price"] = (
-                                    candidate
-                                )
-
-                                print(
-                                    "AMAZON PRICE FOUND:",
-                                    candidate,
-                                )
-
-                                break
-
-                        if (
-                            data["price"]
-                            is not None
-                        ):
-                            break
-
-                    except Exception as e:
-
-                        print(
-                            "AMAZON SELECTOR ERROR:",
-                            selector,
-                            repr(e),
-                        )
-
-                # ---------------------------------------------
-                # AMAZON BODY FALLBACK
-                # ---------------------------------------------
-
-                if data["price"] is None:
-
-                    body_prices = (
-                        find_tl_prices(
-                            body_text
-                        )
-                    )
-
-                    print(
-                        "BODY TL PRICES:",
-                        body_prices[:30],
-                    )
-
-                    if body_prices:
-
-                        # En cok tekrar eden fiyat genelde
-                        # ana urun fiyatidir.
-                        counts = {}
-
-                        for p in body_prices:
-
-                            counts[p] = (
-                                counts.get(
-                                    p,
-                                    0,
-                                )
-                                + 1
-                            )
-
-                        sorted_prices = sorted(
-                            counts.items(),
-                            key=lambda x: (
-                                -x[1],
-                                x[0],
-                            ),
-                        )
-
-                        data["price"] = (
-                            sorted_prices[0][0]
-                        )
-
-                        print(
-                            "AMAZON BODY PRICE:",
-                            data["price"],
-                        )
-
-            # =================================================
-            # HEPSIBURADA
-            # =================================================
-
-            elif store == "Hepsiburada":
-
-                print(
-                    "HEPSIBURADA MODE"
-                )
-
-                hb_selectors = [
-                    '[data-test-id="price-current-price"]',
-                    '[data-test-id*="current-price"]',
-                    '[data-test-id*="price"]',
-                    '[class*="currentPrice"]',
+                selectors = [
+                    ".prc-dsc",
+                    ".prc-slg",
                     '[class*="price"]',
-                    '[class*="Price"]',
                 ]
 
-                for selector in (
-                    hb_selectors
-                ):
+            # N11
+            elif store == "N11":
+
+                selectors = [
+                    ".newPrice ins",
+                    ".price",
+                    '[class*="price"]',
+                ]
+
+            else:
+
+                selectors = [
+                    '[itemprop="price"]',
+                    '[class*="price"]',
+                ]
+
+            if data["price"] is None:
+
+                for selector in selectors:
 
                     try:
-
-                        locator = (
-                            page.locator(
-                                selector
-                            )
+                        locator = page.locator(
+                            selector
                         )
 
-                        count = (
-                            await locator.count()
-                        )
+                        count = await locator.count()
 
                         for i in range(
-                            min(
-                                count,
-                                30,
-                            )
+                            min(count, 20)
                         ):
 
                             text = (
@@ -859,308 +543,136 @@ async def scrape_browser(url):
                             )
 
                             if candidate:
-
-                                data["price"] = (
-                                    candidate
-                                )
-
-                                print(
-                                    "HB PRICE FOUND:",
-                                    candidate,
-                                )
-
+                                data["price"] = candidate
                                 break
 
                         if data["price"]:
                             break
 
                     except Exception:
-                        continue
+                        pass
 
-                # Hepsiburada body fallback
-                if data["price"] is None:
+            # Amazon body fallback
+            if (
+                store == "Amazon Türkiye"
+                and data["price"] is None
+            ):
 
-                    body_prices = (
-                        find_tl_prices(
-                            body_text
+                try:
+                    body = (
+                        await page.locator(
+                            "body"
+                        ).text_content(
+                            timeout=5000
                         )
+                        or ""
                     )
 
-                    print(
-                        "HB BODY PRICES:",
-                        body_prices[:30],
+                    tl_prices = re.findall(
+                        r"(\d{1,3}(?:\.\d{3})*,\d{2})\s*TL",
+                        body,
+                        re.I,
                     )
 
-                    if body_prices:
+                    parsed = [
+                        clean_price(x)
+                        for x in tl_prices
+                    ]
 
+                    parsed = [
+                        x for x in parsed
+                        if x is not None
+                    ]
+
+                    if parsed:
                         counts = {}
 
-                        for p in body_prices:
-
-                            counts[p] = (
+                        for value in parsed:
+                            counts[value] = (
                                 counts.get(
-                                    p,
+                                    value,
                                     0,
                                 )
                                 + 1
                             )
 
-                        ordered = sorted(
+                        data["price"] = sorted(
                             counts.items(),
                             key=lambda x: (
                                 -x[1],
                                 x[0],
                             ),
-                        )
+                        )[0][0]
 
-                        data["price"] = (
-                            ordered[0][0]
-                        )
+                except Exception:
+                    pass
 
-            # =================================================
-            # TRENDYOL
-            # =================================================
-
-            elif store == "Trendyol":
-
-                selectors = [
-                    ".prc-dsc",
-                    ".prc-slg",
-                    '[class*="price"]',
-                ]
-
-                for selector in selectors:
-
-                    try:
-
-                        locator = (
-                            page.locator(
-                                selector
-                            )
-                        )
-
-                        count = (
-                            await locator.count()
-                        )
-
-                        for i in range(
-                            min(
-                                count,
-                                20,
-                            )
-                        ):
-
-                            text = (
-                                await locator
-                                .nth(i)
-                                .text_content(
-                                    timeout=1000
-                                )
-                                or ""
-                            )
-
-                            candidate = clean_price(
-                                text
-                            )
-
-                            if candidate:
-
-                                data["price"] = (
-                                    candidate
-                                )
-
-                                break
-
-                        if data["price"]:
-                            break
-
-                    except Exception:
-                        pass
-
-            # =================================================
-            # N11 / DIGER
-            # =================================================
-
-            else:
-
-                selectors = [
-                    '[itemprop="price"]',
-                    '.newPrice',
-                    '.price',
-                    '[class*="price"]',
-                ]
-
-                for selector in selectors:
-
-                    try:
-
-                        locator = (
-                            page.locator(
-                                selector
-                            )
-                        )
-
-                        count = (
-                            await locator.count()
-                        )
-
-                        for i in range(
-                            min(
-                                count,
-                                20,
-                            )
-                        ):
-
-                            text = (
-                                await locator
-                                .nth(i)
-                                .text_content(
-                                    timeout=1000
-                                )
-                                or ""
-                            )
-
-                            candidate = clean_price(
-                                text
-                            )
-
-                            if candidate:
-
-                                data["price"] = (
-                                    candidate
-                                )
-
-                                break
-
-                        if data["price"]:
-                            break
-
-                    except Exception:
-                        pass
-
-            # =================================================
-            # TITLE
-            # =================================================
-
+            # Title
             if not data["title"]:
 
-                title_selectors = [
+                for selector in [
                     "#productTitle",
                     "h1",
                     '[data-test-id="product-name"]',
-                ]
-
-                for selector in (
-                    title_selectors
-                ):
+                ]:
 
                     try:
+                        node = page.locator(
+                            selector
+                        ).first
 
-                        node = (
-                            page.locator(
-                                selector
-                            ).first
-                        )
-
-                        if (
-                            await node.count()
-                        ):
+                        if await node.count():
 
                             text = (
                                 await node
                                 .text_content(
-                                    timeout=1500
+                                    timeout=1200
                                 )
                                 or ""
-                            )
-
-                            text = text.strip()
+                            ).strip()
 
                             if text:
-
-                                data["title"] = (
-                                    text
-                                )
-
+                                data["title"] = text
                                 break
 
                     except Exception:
                         pass
 
-            # =================================================
-            # IMAGE
-            # =================================================
-
+            # Image
             if not data["image_url"]:
 
-                image_selectors = [
+                for selector in [
                     "#landingImage",
-                    "#imgTagWrapperId img",
                     'img[itemprop="image"]',
-                ]
-
-                for selector in (
-                    image_selectors
-                ):
+                ]:
 
                     try:
+                        node = page.locator(
+                            selector
+                        ).first
 
-                        node = (
-                            page.locator(
-                                selector
-                            ).first
-                        )
+                        if await node.count():
 
-                        if (
-                            await node.count()
-                        ):
-
-                            src = (
-                                await node
-                                .get_attribute(
-                                    "src"
-                                )
+                            src = await node.get_attribute(
+                                "src"
                             )
 
                             if src:
-
-                                data[
-                                    "image_url"
-                                ] = src
-
+                                data["image_url"] = src
                                 break
 
                     except Exception:
                         pass
 
-            print(
-                "FINAL PRICE:",
-                data["price"],
-            )
-
-            print(
-                "FINAL TITLE:",
-                data["title"],
-            )
-
-            print(
-                "=" * 70
-            )
-
-            return (
-                final_url,
-                data,
-            )
+            return final_url, data
 
         finally:
-
             await context.close()
-
             await browser.close()
 
 
 # =========================================================
-# ANA FONKSIYON
+# ANA SCRAPER
 # =========================================================
 
 async def scrape_product(
@@ -1168,73 +680,60 @@ async def scrape_product(
 ) -> ScrapedProduct:
 
     if not url.startswith(
-        (
-            "http://",
-            "https://",
-        )
+        ("http://", "https://")
     ):
-
         raise ValueError(
             "Geçerli bir ürün linki gir."
         )
 
+    store = detect_store(url)
+
+    # =====================================================
+    # HEPSIBURADA ARTIK DIREKT API
+    # =====================================================
+
+    if store == "Hepsiburada":
+
+        print(
+            "HEPSIBURADA -> PARSE API"
+        )
+
+        return await scrape_hepsiburada_api(
+            url
+        )
+
+    # =====================================================
+    # DIGER MAGAZALAR HTTP
+    # =====================================================
+
     http_error = None
 
-    # =====================================================
-    # 1 - HTTP
-    # =====================================================
-
     try:
-
-        final_url, data = (
-            await scrape_http(
-                url
-            )
+        final_url, data = await scrape_http(
+            url
         )
 
         if (
-            data["price"]
-            is not None
+            data["price"] is not None
             and data["title"]
         ):
 
-            print(
-                "HTTP PRICE FOUND:",
-                data["price"],
-            )
-
             return ScrapedProduct(
-                title=data[
-                    "title"
-                ][:500],
-
+                title=data["title"][:500],
                 store=detect_store(
                     final_url
                 ),
-
                 url=final_url,
-
-                price=data[
-                    "price"
-                ],
-
+                price=data["price"],
                 image_url=data[
                     "image_url"
                 ],
-
-                brand=data[
-                    "brand"
-                ],
-
-                model=data[
-                    "model"
-                ],
-
+                brand=data["brand"],
+                model=data["model"],
                 method="http",
             )
 
     except Exception as e:
-
         http_error = e
 
         print(
@@ -1243,71 +742,45 @@ async def scrape_product(
         )
 
     # =====================================================
-    # 2 - CHROMIUM
+    # DIGER MAGAZALAR CHROMIUM
     # =====================================================
 
     try:
-
-        final_url, data = (
-            await scrape_browser(
-                url
-            )
+        final_url, data = await scrape_browser(
+            url
         )
 
         if not data["title"]:
-
             data["title"] = "Ürün"
 
         if data["price"] is None:
-
             raise RuntimeError(
                 "Sayfa açıldı fakat fiyat bulunamadı."
             )
 
         return ScrapedProduct(
-            title=data[
-                "title"
-            ][:500],
-
+            title=data["title"][:500],
             store=detect_store(
                 final_url
             ),
-
             url=final_url,
-
-            price=data[
-                "price"
-            ],
-
+            price=data["price"],
             image_url=data[
                 "image_url"
             ],
-
-            brand=data[
-                "brand"
-            ],
-
-            model=data[
-                "model"
-            ],
-
+            brand=data["brand"],
+            model=data["model"],
             method="browser",
         )
 
-    except Exception as e:
-
-        print(
-            "BROWSER ERROR:",
-            repr(e),
-        )
+    except Exception as browser_error:
 
         if http_error:
-
             raise RuntimeError(
                 f"HTTP başarısız ({http_error}); "
-                f"Chromium da başarısız ({e})"
+                f"Chromium da başarısız ({browser_error})"
             )
 
         raise RuntimeError(
-            f"Chromium başarısız ({e})"
+            f"Chromium başarısız ({browser_error})"
         )
