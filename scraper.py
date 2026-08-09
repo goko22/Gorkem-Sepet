@@ -1,14 +1,15 @@
 import asyncio
 import json
 import re
+from dataclasses import dataclass
+from typing import Optional
+
 import httpx
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse
-from dataclasses import dataclass
-from typing import Optional, Any
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 from utils import detect_store, parse_price
+
 
 HEADERS = {
     "User-Agent": (
@@ -17,8 +18,12 @@ HEADERS = {
         "Chrome/124.0.0.0 Safari/537.36"
     ),
     "Accept-Language": "tr-TR,tr;q=0.9,en;q=0.8",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept": (
+        "text/html,application/xhtml+xml,"
+        "application/xml;q=0.9,*/*;q=0.8"
+    ),
 }
+
 
 @dataclass
 class ScrapedProduct:
@@ -29,454 +34,994 @@ class ScrapedProduct:
     image_url: Optional[str] = None
     brand: Optional[str] = None
     model: Optional[str] = None
-    method: str = "http"
+    method: str = "unknown"
 
-def _walk_json_for_product(data):
+
+# ---------------------------------------------------------
+# YARDIMCI FONKSIYONLAR
+# ---------------------------------------------------------
+
+def extract_product_code(url: str):
+    # Hepsiburada
+    match = re.search(r"(HBCV[A-Z0-9]+)", url, re.I)
+
+    if match:
+        return match.group(1).upper()
+
+    # Amazon ASIN
+    match = re.search(
+        r"/(?:dp|gp/product)/([A-Z0-9]{10})",
+        url,
+        re.I
+    )
+
+    if match:
+        return match.group(1).upper()
+
+    return None
+
+
+def walk_for_product(data):
     if isinstance(data, dict):
-        t = data.get("@type")
-        if t == "Product" or (isinstance(t, list) and "Product" in t):
+
+        product_type = data.get("@type")
+
+        if product_type == "Product":
             return data
+
+        if (
+            isinstance(product_type, list)
+            and "Product" in product_type
+        ):
+            return data
+
         for value in data.values():
-            found = _walk_json_for_product(value)
-            if found:
-                return found
+            result = walk_for_product(value)
+
+            if result:
+                return result
+
     elif isinstance(data, list):
+
         for item in data:
-            found = _walk_json_for_product(item)
-            if found:
-                return found
-    return None
+            result = walk_for_product(item)
 
-def _extract_product_code(url: str):
-    m = re.search(r"(HBCV[A-Z0-9]+)", url, re.I)
-    if m:
-        return m.group(1).upper()
-
-    m = re.search(r"/dp/([A-Z0-9]{8,})", url, re.I)
-    if m:
-        return m.group(1).upper()
+            if result:
+                return result
 
     return None
 
-PRICE_KEYS = {
-    "price", "currentprice", "saleprice", "sellingprice", "discountedprice",
-    "finalprice", "actualprice", "unitprice", "amount", "lowprice",
-    "merchantprice", "listingprice", "buyboxprice"
-}
 
-def _key_norm(key: Any):
-    return re.sub(r"[^a-z]", "", str(key).lower())
+def get_price_from_product_json(product):
+    if not isinstance(product, dict):
+        return None
 
-def _collect_price_candidates(obj, path="", candidates=None):
-    if candidates is None:
-        candidates = []
+    offers = product.get("offers")
 
-    if isinstance(obj, dict):
-        for key, value in obj.items():
-            np = _key_norm(key)
-            child_path = f"{path}.{key}" if path else str(key)
+    if isinstance(offers, dict):
+        offers = [offers]
 
-            if any(pk in np for pk in PRICE_KEYS):
-                if isinstance(value, (int, float, str)):
-                    p = parse_price(value)
-                    if p is not None and 1 <= p <= 50_000_000:
-                        score = 10
-                        if "current" in np or "selling" in np or "sale" in np or "discount" in np:
-                            score += 5
-                        if "original" in np or "old" in np or "list" in np:
-                            score -= 3
-                        candidates.append((score, p, child_path))
+    if not isinstance(offers, list):
+        return None
 
-            _collect_price_candidates(value, child_path, candidates)
+    for offer in offers:
 
-    elif isinstance(obj, list):
-        for i, value in enumerate(obj[:500]):
-            _collect_price_candidates(value, f"{path}[{i}]", candidates)
+        if not isinstance(offer, dict):
+            continue
 
-    return candidates
+        for key in [
+            "price",
+            "lowPrice",
+            "highPrice",
+            "salePrice",
+            "sellingPrice",
+        ]:
 
-def _best_price_from_json(obj, required_token=None):
+            price = parse_price(offer.get(key))
+
+            if price is not None:
+                return price
+
+    return None
+
+
+def find_prices_in_json(data, product_code=None):
+    results = []
+
+    interesting_keys = [
+        "price",
+        "currentprice",
+        "saleprice",
+        "sellingprice",
+        "discountedprice",
+        "finalprice",
+        "buyboxprice",
+        "merchantprice",
+        "unitprice",
+        "lowprice",
+    ]
+
     try:
-        dumped = json.dumps(obj, ensure_ascii=False)
+        serialized = json.dumps(
+            data,
+            ensure_ascii=False
+        ).lower()
     except Exception:
-        dumped = ""
+        serialized = ""
 
-    if required_token and required_token.lower() not in dumped.lower():
-        return None
+    # Ürün kodumuz varsa JSON gerçekten bu ürüne ait olsun.
+    if (
+        product_code
+        and product_code.lower() not in serialized
+    ):
+        return []
 
-    candidates = _collect_price_candidates(obj)
-    if not candidates:
-        return None
+    def walk(obj, path=""):
 
-    # Highest semantic score first; for ties choose the smaller positive price,
-    # which usually corresponds to the current/sale price instead of old/list price.
-    candidates.sort(key=lambda x: (-x[0], x[1]))
-    return candidates[0][1]
+        if isinstance(obj, dict):
 
-def _extract_from_html(html: str, final_url: str):
-    soup = BeautifulSoup(html, "html.parser")
+            for key, value in obj.items():
+
+                normalized = re.sub(
+                    r"[^a-z]",
+                    "",
+                    str(key).lower()
+                )
+
+                new_path = (
+                    f"{path}.{key}"
+                    if path
+                    else str(key)
+                )
+
+                if any(
+                    word in normalized
+                    for word in interesting_keys
+                ):
+
+                    if isinstance(
+                        value,
+                        (str, int, float)
+                    ):
+
+                        price = parse_price(value)
+
+                        if (
+                            price is not None
+                            and 1 <= price <= 50_000_000
+                        ):
+
+                            score = 10
+
+                            if any(
+                                x in normalized
+                                for x in [
+                                    "current",
+                                    "selling",
+                                    "sale",
+                                    "discount",
+                                    "final",
+                                    "buybox",
+                                ]
+                            ):
+                                score += 10
+
+                            results.append(
+                                (
+                                    score,
+                                    price,
+                                    new_path
+                                )
+                            )
+
+                walk(
+                    value,
+                    new_path
+                )
+
+        elif isinstance(obj, list):
+
+            for i, item in enumerate(obj[:1000]):
+
+                walk(
+                    item,
+                    f"{path}[{i}]"
+                )
+
+    walk(data)
+
+    return results
+
+
+def extract_html_data(html: str, url: str):
+    soup = BeautifulSoup(
+        html,
+        "html.parser"
+    )
+
     title = None
-    image_url = None
     price = None
+    image_url = None
     brand = None
     model = None
 
-    for script in soup.find_all("script", type="application/ld+json"):
-        raw = script.string or script.get_text(strip=True)
+    # -----------------------------------------------------
+    # JSON-LD
+    # -----------------------------------------------------
+
+    for script in soup.find_all(
+        "script",
+        type="application/ld+json"
+    ):
+
+        raw = (
+            script.string
+            or script.get_text(
+                strip=True
+            )
+        )
+
         if not raw:
             continue
+
         try:
             data = json.loads(raw)
         except Exception:
             continue
 
-        item = _walk_json_for_product(data)
-        if not item:
+        product = walk_for_product(data)
+
+        if not product:
             continue
 
-        title = item.get("name") or title
+        title = (
+            product.get("name")
+            or title
+        )
 
-        image = item.get("image")
-        if isinstance(image, list) and image:
-            image_url = image[0]
-        elif isinstance(image, dict):
-            image_url = image.get("url")
-        elif isinstance(image, str):
+        price = (
+            get_price_from_product_json(
+                product
+            )
+            or price
+        )
+
+        image = product.get("image")
+
+        if isinstance(image, str):
             image_url = image
 
-        brand_obj = item.get("brand")
-        if isinstance(brand_obj, dict):
-            brand = brand_obj.get("name")
-        elif isinstance(brand_obj, str):
-            brand = brand_obj
+        elif (
+            isinstance(image, list)
+            and image
+        ):
+            image_url = image[0]
 
-        model = item.get("model") or item.get("mpn") or item.get("sku")
+        elif isinstance(image, dict):
+            image_url = image.get("url")
 
-        offers = item.get("offers")
-        offer_candidates = offers if isinstance(offers, list) else [offers]
-        for offer in offer_candidates:
-            if isinstance(offer, dict):
-                parsed = (
-                    parse_price(offer.get("price"))
-                    or parse_price(offer.get("lowPrice"))
-                )
-                if parsed is not None:
-                    price = parsed
-                    break
+        brand_data = product.get("brand")
 
-    # Scan embedded JSON/state scripts too, not only JSON-LD.
-    if price is None:
-        code = _extract_product_code(final_url)
-        for script in soup.find_all("script"):
-            raw = script.string or script.get_text(" ", strip=True)
-            if not raw or len(raw) < 20:
-                continue
+        if isinstance(
+            brand_data,
+            dict
+        ):
+            brand = brand_data.get("name")
 
-            if code and code.lower() not in raw.lower():
-                continue
+        elif isinstance(
+            brand_data,
+            str
+        ):
+            brand = brand_data
 
-            # First try direct JSON.
-            try:
-                data = json.loads(raw)
-                candidate = _best_price_from_json(data, required_token=code)
-                if candidate:
-                    price = candidate
-                    break
-            except Exception:
-                pass
+        model = (
+            product.get("model")
+            or product.get("mpn")
+            or product.get("sku")
+        )
 
-            # Then inspect likely price fields in serialized JS state.
-            patterns = [
-                r'"(?:currentPrice|salePrice|sellingPrice|discountedPrice|finalPrice|price)"\s*:\s*"?(?P<p>\d[\d.,]*)"?',
-                r"'(?:currentPrice|salePrice|sellingPrice|discountedPrice|finalPrice|price)'\s*:\s*'?(?P<p>\d[\d.,]*)'?",
-            ]
-            for pat in patterns:
-                m = re.search(pat, raw, re.I)
-                if m:
-                    candidate = parse_price(m.group("p"))
-                    if candidate:
-                        price = candidate
-                        break
-            if price is not None:
-                break
+    # -----------------------------------------------------
+    # OPEN GRAPH
+    # -----------------------------------------------------
 
     if not title:
-        meta = soup.find("meta", property="og:title")
-        if meta and meta.get("content"):
-            title = meta["content"].strip()
+
+        node = soup.find(
+            "meta",
+            property="og:title"
+        )
+
+        if node:
+            title = node.get("content")
 
     if not image_url:
-        meta = soup.find("meta", property="og:image")
-        if meta and meta.get("content"):
-            image_url = urljoin(final_url, meta["content"])
+
+        node = soup.find(
+            "meta",
+            property="og:image"
+        )
+
+        if node:
+            image_url = node.get("content")
+
+    # -----------------------------------------------------
+    # META PRICE
+    # -----------------------------------------------------
 
     if price is None:
-        for selector in [
+
+        selectors = [
             'meta[property="product:price:amount"]',
             'meta[property="og:price:amount"]',
             'meta[itemprop="price"]',
-            '[itemprop="price"]',
-            '[data-testid*="price"]',
-            '[data-test-id*="price"]',
-            '[class*="price"]',
-            '[class*="Price"]',
-        ]:
-            for node in soup.select(selector)[:50]:
-                candidate = (
-                    node.get("content")
-                    or node.get("value")
-                    or node.get_text(" ", strip=True)
-                )
-                parsed = parse_price(candidate)
-                if parsed is not None:
-                    price = parsed
-                    break
-            if price is not None:
+        ]
+
+        for selector in selectors:
+
+            node = soup.select_one(
+                selector
+            )
+
+            if not node:
+                continue
+
+            price = parse_price(
+                node.get("content")
+                or node.get("value")
+            )
+
+            if price:
                 break
 
     if not title and soup.title:
-        title = soup.title.get_text(" ", strip=True)
+
+        title = soup.title.get_text(
+            " ",
+            strip=True
+        )
 
     return {
         "title": title,
-        "image_url": image_url,
         "price": price,
+        "image_url": image_url,
         "brand": brand,
         "model": model,
     }
 
-async def _scrape_http(url: str):
+
+# ---------------------------------------------------------
+# NORMAL HTTP
+# ---------------------------------------------------------
+
+async def scrape_http(url: str):
+
     async with httpx.AsyncClient(
         headers=HEADERS,
         follow_redirects=True,
-        timeout=20.0,
+        timeout=20
     ) as client:
+
         response = await client.get(url)
+
         response.raise_for_status()
-        final_url = str(response.url)
-        data = _extract_from_html(response.text, final_url)
+
+        final_url = str(
+            response.url
+        )
+
+        data = extract_html_data(
+            response.text,
+            final_url
+        )
+
         return final_url, data
 
-async def _first_text(page, selectors):
-    for selector in selectors:
-        try:
-            locator = page.locator(selector).first
-            if await locator.count():
-                txt = (await locator.inner_text(timeout=1800)).strip()
-                if txt:
-                    return txt
-        except Exception:
-            pass
-    return None
 
-async def _first_attr(page, selectors, attr):
-    for selector in selectors:
-        try:
-            locator = page.locator(selector).first
-            if await locator.count():
-                value = await locator.get_attribute(attr, timeout=1800)
-                if value:
-                    return value
-        except Exception:
-            pass
-    return None
+# ---------------------------------------------------------
+# PLAYWRIGHT / CHROMIUM
+# ---------------------------------------------------------
 
-async def _scrape_browser(url: str):
-    product_code = _extract_product_code(url)
-    network_prices = []
-    network_debug = []
+async def scrape_browser(url: str):
+
+    product_code = (
+        extract_product_code(url)
+    )
+
+    captured_prices = []
+
+    network_urls = []
 
     async with async_playwright() as p:
+
         browser = await p.chromium.launch(
             headless=True,
             args=[
-                "--disable-dev-shm-usage",
                 "--no-sandbox",
+                "--disable-dev-shm-usage",
             ],
         )
+
         context = await browser.new_context(
             locale="tr-TR",
             timezone_id="Europe/Istanbul",
             user_agent=HEADERS["User-Agent"],
-            viewport={"width": 1440, "height": 1200},
+            viewport={
+                "width": 1440,
+                "height": 1200,
+            },
             extra_http_headers={
-                "Accept-Language": "tr-TR,tr;q=0.9,en;q=0.8",
+                "Accept-Language":
+                    "tr-TR,tr;q=0.9,en;q=0.8"
             },
         )
+
         page = await context.new_page()
 
-        async def inspect_response(response):
+        # -------------------------------------------------
+        # NETWORK RESPONSE DINLE
+        # -------------------------------------------------
+
+        async def inspect_response(
+            response
+        ):
+
             try:
-                ctype = (response.headers.get("content-type") or "").lower()
-                rurl = response.url.lower()
 
-                if "json" not in ctype and not any(x in rurl for x in [
-                    "product", "price", "listing", "merchant", "offer", "buybox"
-                ]):
+                url_lower = (
+                    response.url.lower()
+                )
+
+                content_type = (
+                    response.headers.get(
+                        "content-type",
+                        ""
+                    ).lower()
+                )
+
+                if any(
+                    keyword in url_lower
+                    for keyword in [
+                        "product",
+                        "price",
+                        "offer",
+                        "listing",
+                        "merchant",
+                        "buybox",
+                    ]
+                ):
+                    network_urls.append(
+                        f"{response.status} "
+                        f"{response.url}"
+                    )
+
+                if (
+                    "json"
+                    not in content_type
+                ):
                     return
 
-                body = await response.body()
-                if not body or len(body) > 5_000_000:
+                body = (
+                    await response.body()
+                )
+
+                if (
+                    not body
+                    or len(body)
+                    > 5_000_000
+                ):
                     return
 
-                text = body.decode("utf-8", errors="ignore")
+                text = body.decode(
+                    "utf-8",
+                    errors="ignore"
+                )
 
-                # Require product token when we have one. This avoids accidentally
-                # taking prices from recommendation widgets or unrelated products.
-                if product_code and product_code.lower() not in text.lower():
+                if (
+                    product_code
+                    and
+                    product_code.lower()
+                    not in text.lower()
+                ):
                     return
 
                 try:
-                    payload = json.loads(text)
+                    payload = json.loads(
+                        text
+                    )
                 except Exception:
                     return
 
-                candidate = _best_price_from_json(
-                    payload,
-                    required_token=product_code,
+                candidates = (
+                    find_prices_in_json(
+                        payload,
+                        product_code
+                    )
                 )
-                if candidate is not None:
-                    network_prices.append(candidate)
-                    network_debug.append(response.url)
+
+                for candidate in candidates:
+
+                    captured_prices.append(
+                        candidate
+                    )
+
             except Exception:
+
                 pass
 
-        def response_handler(response):
-            asyncio.create_task(inspect_response(response))
+        def on_response(response):
 
-        page.on("response", response_handler)
+            asyncio.create_task(
+                inspect_response(
+                    response
+                )
+            )
+
+        page.on(
+            "response",
+            on_response
+        )
+
+        # -------------------------------------------------
+        # SAYFAYI AC
+        # -------------------------------------------------
 
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=45000)
 
-            # Give product APIs/XHR time to finish.
+            await page.goto(
+                url,
+                wait_until="domcontentloaded",
+                timeout=45000
+            )
+
             try:
-                await page.wait_for_load_state("networkidle", timeout=12000)
+
+                await page.wait_for_load_state(
+                    "networkidle",
+                    timeout=12000
+                )
+
             except PlaywrightTimeoutError:
-                await page.wait_for_timeout(5000)
+
+                await page.wait_for_timeout(
+                    5000
+                )
 
             final_url = page.url
-            html = await page.content()
-            data = _extract_from_html(html, final_url)
-            store = detect_store(final_url)
 
-            selector_map = {
-                "Hepsiburada": [
+            store = detect_store(
+                final_url
+            )
+
+            html = await page.content()
+
+            data = extract_html_data(
+                html,
+                final_url
+            )
+
+            # ---------------------------------------------
+            # DEBUG
+            # ---------------------------------------------
+
+            print(
+                "\n"
+                + "=" * 80
+            )
+
+            print(
+                "STORE:",
+                store
+            )
+
+            print(
+                "FINAL URL:",
+                final_url
+            )
+
+            print(
+                "PAGE TITLE:",
+                await page.title()
+            )
+
+            print(
+                "HTML LENGTH:",
+                len(html)
+            )
+
+            try:
+
+                body_text = (
+                    await page.locator(
+                        "body"
+                    ).inner_text(
+                        timeout=5000
+                    )
+                )
+
+            except Exception as e:
+
+                body_text = (
+                    f"BODY ERROR: {e}"
+                )
+
+            print(
+                "BODY START:"
+            )
+
+            print(
+                body_text[:5000]
+            )
+
+            # ---------------------------------------------
+            # DOM SELECTORLARI
+            # ---------------------------------------------
+
+            selectors = []
+
+            if store == "Hepsiburada":
+
+                selectors = [
                     '[data-test-id="price-current-price"]',
-                    '[data-test-id*="current-price"]',
                     '[data-test-id*="price"]',
                     '[class*="currentPrice"]',
                     '[class*="price"]',
-                ],
-                "Amazon Türkiye": [
+                    '[class*="Price"]',
+                ]
+
+            elif store == "Amazon Türkiye":
+
+                selectors = [
+                    '.priceToPay .a-offscreen',
                     '#corePriceDisplay_desktop_feature_div .a-price .a-offscreen',
                     '#corePrice_feature_div .a-price .a-offscreen',
-                    '.priceToPay .a-offscreen',
                     '#priceblock_ourprice',
                     '#priceblock_dealprice',
                     '.a-price .a-offscreen',
-                ],
-                "Trendyol": [
+                ]
+
+            elif store == "Trendyol":
+
+                selectors = [
                     '.prc-dsc',
                     '.prc-slg',
                     '[class*="price"]',
-                ],
-                "N11": [
+                ]
+
+            elif store == "N11":
+
+                selectors = [
                     '.newPrice ins',
                     '.price',
                     '[class*="price"]',
-                ],
-            }
+                ]
 
-            if data.get("price") is None:
-                txt = await _first_text(
-                    page,
-                    selector_map.get(store, ['[class*="price"]'])
+            else:
+
+                selectors = [
+                    '[itemprop="price"]',
+                    '[class*="price"]',
+                ]
+
+            # ---------------------------------------------
+            # DOM FIYAT
+            # ---------------------------------------------
+
+            if data["price"] is None:
+
+                for selector in selectors:
+
+                    try:
+
+                        locator = (
+                            page.locator(
+                                selector
+                            )
+                        )
+
+                        count = (
+                            await locator.count()
+                        )
+
+                        for i in range(
+                            min(
+                                count,
+                                20
+                            )
+                        ):
+
+                            node = (
+                                locator.nth(i)
+                            )
+
+                            text = (
+                                await node.inner_text(
+                                    timeout=1000
+                                )
+                            )
+
+                            candidate = (
+                                parse_price(
+                                    text
+                                )
+                            )
+
+                            if candidate:
+
+                                print(
+                                    "DOM PRICE:",
+                                    candidate,
+                                    selector
+                                )
+
+                                data["price"] = (
+                                    candidate
+                                )
+
+                                break
+
+                        if (
+                            data["price"]
+                            is not None
+                        ):
+                            break
+
+                    except Exception:
+
+                        continue
+
+            # ---------------------------------------------
+            # NETWORK FIYAT
+            # ---------------------------------------------
+
+            if captured_prices:
+
+                captured_prices.sort(
+                    key=lambda x: (
+                        -x[0],
+                        x[1]
+                    )
                 )
-                data["price"] = parse_price(txt)
 
-            # Network JSON is preferred over broad generic price-class scraping
-            # when it is tied to the exact product code.
-            if network_prices:
-                data["price"] = sorted(network_prices)[0]
+                print(
+                    "NETWORK PRICE CANDIDATES:"
+                )
 
-            if not data.get("title"):
-                data["title"] = await _first_text(page, [
-                    'h1',
-                    '#productTitle',
+                for candidate in (
+                    captured_prices[:20]
+                ):
+
+                    print(candidate)
+
+                # Network JSON exact product code ile
+                # eşleştiği için generic DOM'dan daha
+                # güvenilir.
+                data["price"] = (
+                    captured_prices[0][1]
+                )
+
+            # ---------------------------------------------
+            # TITLE
+            # ---------------------------------------------
+
+            if not data["title"]:
+
+                for selector in [
+                    "h1",
+                    "#productTitle",
                     '[data-test-id="product-name"]',
-                ])
+                ]:
 
-            if not data.get("image_url"):
-                data["image_url"] = await _first_attr(page, [
-                    '#landingImage',
-                    'img[itemprop="image"]',
-                ], "src")
-                if not data["image_url"]:
-                    data["image_url"] = await _first_attr(
-                        page,
-                        ['meta[property="og:image"]'],
-                        "content",
+                    try:
+
+                        node = (
+                            page.locator(
+                                selector
+                            ).first
+                        )
+
+                        if (
+                            await node.count()
+                        ):
+
+                            text = (
+                                await node.inner_text(
+                                    timeout=1500
+                                )
+                            )
+
+                            if text.strip():
+
+                                data["title"] = (
+                                    text.strip()
+                                )
+
+                                break
+
+                    except Exception:
+
+                        pass
+
+            # ---------------------------------------------
+            # IMAGE
+            # ---------------------------------------------
+
+            if not data["image_url"]:
+
+                try:
+
+                    image = (
+                        page.locator(
+                            "#landingImage"
+                        ).first
                     )
 
-            data["_network_sources"] = network_debug[:5]
-            return final_url, data
+                    if (
+                        await image.count()
+                    ):
+
+                        data["image_url"] = (
+                            await image.get_attribute(
+                                "src"
+                            )
+                        )
+
+                except Exception:
+
+                    pass
+
+            # ---------------------------------------------
+            # LOG NETWORK
+            # ---------------------------------------------
+
+            print(
+                "NETWORK URLS:"
+            )
+
+            for item in (
+                network_urls[-100:]
+            ):
+
+                print(item)
+
+            print(
+                "FINAL PRICE:",
+                data["price"]
+            )
+
+            print(
+                "=" * 80
+                + "\n"
+            )
+
+            return (
+                final_url,
+                data
+            )
 
         finally:
-            await page.wait_for_timeout(300)
+
+            await page.wait_for_timeout(
+                500
+            )
+
             await context.close()
+
             await browser.close()
 
-async def scrape_product(url: str) -> ScrapedProduct:
-    if not url.startswith(("http://", "https://")):
-        raise ValueError("Geçerli bir http/https ürün linki gir.")
+
+# ---------------------------------------------------------
+# ANA SCRAPER
+# ---------------------------------------------------------
+
+async def scrape_product(
+    url: str
+) -> ScrapedProduct:
+
+    if not url.startswith(
+        ("http://", "https://")
+    ):
+
+        raise ValueError(
+            "Geçerli bir ürün linki gir."
+        )
 
     http_error = None
 
+    # -----------------------------------------------------
+    # 1. NORMAL HTTP DENE
+    # -----------------------------------------------------
+
     try:
-        final_url, data = await _scrape_http(url)
-        if data.get("price") is not None and data.get("title"):
+
+        final_url, data = (
+            await scrape_http(url)
+        )
+
+        if (
+            data["price"]
+            is not None
+            and data["title"]
+        ):
+
             return ScrapedProduct(
                 title=data["title"][:500],
-                store=detect_store(final_url),
+                store=detect_store(
+                    final_url
+                ),
                 url=final_url,
-                price=data.get("price"),
-                image_url=data.get("image_url"),
-                brand=data.get("brand"),
-                model=data.get("model"),
+                price=data["price"],
+                image_url=data[
+                    "image_url"
+                ],
+                brand=data["brand"],
+                model=data["model"],
                 method="http",
             )
+
     except Exception as e:
+
         http_error = e
 
-    try:
-        final_url, data = await _scrape_browser(url)
+        print(
+            "HTTP SCRAPER ERROR:",
+            repr(e)
+        )
 
-        if not data.get("title"):
+    # -----------------------------------------------------
+    # 2. CHROMIUM DENE
+    # -----------------------------------------------------
+
+    try:
+
+        final_url, data = (
+            await scrape_browser(url)
+        )
+
+        if not data["title"]:
+
             data["title"] = "Ürün"
 
-        if data.get("price") is None:
-            raise ValueError(
-                "Sayfa açıldı fakat DOM, gömülü JSON ve network cevaplarında "
-                "bu ürüne bağlı fiyat bulunamadı."
+        if data["price"] is None:
+
+            raise RuntimeError(
+                "Sayfa açıldı ancak fiyat "
+                "DOM veya network içinde "
+                "bulunamadı. Render loglarını "
+                "kontrol et."
             )
 
         return ScrapedProduct(
             title=data["title"][:500],
-            store=detect_store(final_url),
+            store=detect_store(
+                final_url
+            ),
             url=final_url,
-            price=data.get("price"),
-            image_url=data.get("image_url"),
-            brand=data.get("brand"),
-            model=data.get("model"),
-            method="browser+network",
+            price=data["price"],
+            image_url=data[
+                "image_url"
+            ],
+            brand=data["brand"],
+            model=data["model"],
+            method="browser",
         )
+
     except Exception as browser_error:
+
+        print(
+            "BROWSER SCRAPER ERROR:",
+            repr(browser_error)
+        )
+
         if http_error:
+
             raise RuntimeError(
-                f"HTTP başarısız ({http_error}); "
-                f"Chromium/network denemesi de başarısız ({browser_error})"
+                "HTTP başarısız: "
+                f"{http_error}; "
+                "Chromium da başarısız: "
+                f"{browser_error}"
             )
+
         raise RuntimeError(
-            f"Chromium/network ile fiyat alınamadı: {browser_error}"
+            "Chromium başarısız: "
+            f"{browser_error}"
         )
