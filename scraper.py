@@ -39,7 +39,7 @@ HTTP_TIMEOUT = httpx.Timeout(
     pool=4.0,
 )
 
-BROWSER_GOTO_TIMEOUT = 12000
+BROWSER_GOTO_TIMEOUT = 25000
 
 
 # =========================================================
