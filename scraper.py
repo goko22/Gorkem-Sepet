@@ -764,6 +764,14 @@ async def scrape_hepsiburada_api(
         response.raise_for_status()
 
         payload = response.json()
+        print(
+    "HEPSIBURADA RAW PAYLOAD:",
+    json.dumps(
+        payload,
+        ensure_ascii=False,
+        default=str,
+    )
+)
 
         data = payload.get(
             "data",
